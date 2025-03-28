@@ -12,12 +12,16 @@ from .cuda._wrapper import (
     fully_fused_projection,
     fully_fused_projection_2dgs,
     fully_fused_projection_with_ut,
+    integrate_to_points,
     isect_offset_encode,
     isect_tiles,
+    points_isect_tiles,
+    project_points,
     rasterize_to_pixels,
     rasterize_to_pixels_2dgs,
     rasterize_to_pixels_eval3d,
     spherical_harmonics,
+    view_to_gaussians,
 )
 from .distributed import (
     all_gather_int32,
@@ -288,9 +292,9 @@ def rasterization(
             colors.dim() == 3 and colors.shape[:2] == (C, N)
         ), colors.shape
         if distributed:
-            assert (
-                colors.dim() == 2
-            ), "Distributed mode only supports per-Gaussian colors."
+            assert colors.dim() == 2, (
+                "Distributed mode only supports per-Gaussian colors."
+            )
     else:
         # treat colors as SH coefficients, should be in shape [N, K, 3] or [C, N, K, 3]
         # Allowing for activating partial SH bands
@@ -301,9 +305,9 @@ def rasterization(
         ), colors.shape
         assert (sh_degree + 1) ** 2 <= colors.shape[-2], colors.shape
         if distributed:
-            assert (
-                colors.dim() == 3
-            ), "Distributed mode only supports per-Gaussian colors."
+            assert colors.dim() == 3, (
+                "Distributed mode only supports per-Gaussian colors."
+            )
 
     if absgrad:
         assert not distributed, "AbsGrad is not supported in distributed mode."
@@ -1277,7 +1281,9 @@ def rasterization_2dgs(
             "ED",
             "RGB+D",
             "RGB+ED",
-        ], f"distloss requires depth rendering, render_mode should be D, ED, RGB+D, RGB+ED, but got {render_mode}"
+        ], (
+            f"distloss requires depth rendering, render_mode should be D, ED, RGB+D, RGB+ED, but got {render_mode}"
+        )
 
     if sh_degree is None:
         # treat colors as post-activation values
@@ -1287,9 +1293,9 @@ def rasterization_2dgs(
         ), colors.shape
     else:
         # treat colors as SH coefficients. Allowing for activating partial SH bands
-        assert (
-            colors.dim() == 3 and colors.shape[0] == N and colors.shape[2] == 3
-        ), colors.shape
+        assert colors.dim() == 3 and colors.shape[0] == N and colors.shape[2] == 3, (
+            colors.shape
+        )
         assert (sh_degree + 1) ** 2 <= colors.shape[1], colors.shape
 
     # Compute Ray-Splat intersection transformation.
@@ -1608,3 +1614,245 @@ def rasterization_2dgs_inria_wrapper(
         "gaussian_ids": None,
     }
     return (render_colors, render_alphas), meta
+
+
+@torch.no_grad()
+def integration(
+    points: Tensor,  # [N, 3]
+    means: Tensor,  # [N, 3]
+    quats: Tensor,  # [N, 4]
+    scales: Tensor,  # [N, 3]
+    opacities: Tensor,  # [N]
+    colors: Tensor,  # [(C,) N, D] or [(C,) N, K, 3]
+    viewmats: Tensor,  # [C, 4, 4]
+    Ks: Tensor,  # [C, 3, 3]
+    width: int,
+    height: int,
+    near_plane: float = 0.01,
+    far_plane: float = 1e10,
+    radius_clip: float = 0.0,
+    eps2d: float = 0.3,
+    sh_degree: Optional[int] = None,
+    packed: bool = False,
+    tile_size: int = 16,
+    backgrounds: Optional[Tensor] = None,
+    render_mode: Literal["RGB", "D", "ED", "RGB+D", "RGB+ED"] = "RGB",
+    sparse_grad: bool = False,
+    absgrad: bool = False,
+    rasterize_mode: Literal["classic", "antialiased"] = "classic",
+) -> Tuple[Tensor, Tensor, Dict]:
+    meta = {}
+
+    N = means.shape[0]
+    C = viewmats.shape[0]
+    assert means.shape == (N, 3), means.shape
+    assert quats.shape == (N, 4), quats.shape
+    assert scales.shape == (N, 3), scales.shape
+    assert opacities.shape == (N,), opacities.shape
+    assert viewmats.shape == (C, 4, 4), viewmats.shape
+    assert Ks.shape == (C, 3, 3), Ks.shape
+    assert render_mode in ["RGB", "D", "ED", "RGB+D", "RGB+ED"], render_mode
+    assert packed is False
+
+    if sh_degree is None:
+        # treat colors as post-activation values, should be in shape [N, D] or [C, N, D]
+        assert (colors.dim() == 2 and colors.shape[0] == N) or (
+            colors.dim() == 3 and colors.shape[:2] == (C, N)
+        ), colors.shape
+    else:
+        # treat colors as SH coefficients, should be in shape [N, K, 3] or [C, N, K, 3]
+        # Allowing for activating partial SH bands
+        assert (
+            colors.dim() == 3 and colors.shape[0] == N and colors.shape[2] == 3
+        ) or (
+            colors.dim() == 4 and colors.shape[:2] == (C, N) and colors.shape[3] == 3
+        ), colors.shape
+        assert (sh_degree + 1) ** 2 <= colors.shape[-2], colors.shape
+
+    # Project Gaussians to 2D. Directly pass in {quats, scales} is faster than precomputing covars.
+    proj_results = fully_fused_projection(
+        means,
+        # covars,
+        None,
+        quats,
+        scales,
+        viewmats,
+        Ks,
+        width,
+        height,
+        eps2d=eps2d,
+        packed=packed,
+        near_plane=near_plane,
+        far_plane=far_plane,
+        radius_clip=radius_clip,
+        sparse_grad=sparse_grad,
+        calc_compensations=(rasterize_mode == "antialiased"),
+        opacities=opacities,  # use opacities to compute a tigher bound for radii.
+    )
+
+    if packed:
+        # The results are packed into shape [nnz, ...]. All elements are valid.
+        (
+            camera_ids,
+            gaussian_ids,
+            radii,
+            means2d,
+            depths,
+            conics,
+            compensations,
+        ) = proj_results
+        opacities = opacities[gaussian_ids]  # [nnz]
+    else:
+        # The results are with shape [C, N, ...]. Only the elements with radii > 0 are valid.
+        radii, means2d, depths, conics, compensations = proj_results
+        opacities = opacities.repeat(C, 1)  # [C, N]
+        camera_ids, gaussian_ids = None, None
+
+    # if compensations is not None:
+    #     opacities = opacities * compensations
+
+    # Identify intersecting tiles
+    tile_width = math.ceil(width / float(tile_size))
+    tile_height = math.ceil(height / float(tile_size))
+    tiles_per_gauss, isect_ids, flatten_ids = isect_tiles(
+        means2d,
+        radii,
+        depths,
+        tile_size,
+        tile_width,
+        tile_height,
+        packed=packed,
+        n_cameras=C,
+        camera_ids=camera_ids,
+        gaussian_ids=gaussian_ids,
+    )
+    isect_offsets = isect_offset_encode(isect_ids, C, tile_width, tile_height)
+
+    # create tiles and isect_offsets for input points
+    points_radii, points2d, point_depths = project_points(
+        points,
+        viewmats,
+        Ks,
+        width,
+        height,
+        near_plane=near_plane,
+        far_plane=far_plane,
+    )
+
+    point_isect_ids, point_flatten_ids = points_isect_tiles(
+        points2d,
+        points_radii,
+        point_depths,
+        tile_size,
+        tile_width,
+        tile_height,
+        packed=packed,
+        n_cameras=C,
+        camera_ids=camera_ids,
+        gaussian_ids=gaussian_ids,
+    )
+    point_isect_offsets = isect_offset_encode(
+        point_isect_ids, C, tile_width, tile_height
+    )
+
+    meta.update(
+        {
+            # global camera_ids
+            "camera_ids": camera_ids,
+            # local gaussian_ids
+            "gaussian_ids": gaussian_ids,
+            "radii": radii,
+            "means2d": means2d,
+            "depths": depths,
+            "conics": conics,
+            "opacities": opacities,
+        }
+    )
+
+    # Turn colors into [C, N, D] or [nnz, D] to pass into rasterize_to_pixels()
+    if sh_degree is None:
+        # Colors are post-activation values, with shape [N, D] or [C, N, D]
+        if packed:
+            if colors.dim() == 2:
+                # Turn [N, D] into [nnz, D]
+                colors = colors[gaussian_ids]
+            else:
+                # Turn [C, N, D] into [nnz, D]
+                colors = colors[camera_ids, gaussian_ids]
+        else:
+            if colors.dim() == 2:
+                # Turn [N, D] into [C, N, D]
+                colors = colors.expand(C, -1, -1)
+            else:
+                # colors is already [C, N, D]
+                pass
+    else:
+        # Colors are SH coefficients, with shape [N, K, 3] or [C, N, K, 3]
+        camtoworlds = torch.inverse(viewmats)  # [C, 4, 4]
+        if packed:
+            dirs = means[gaussian_ids, :] - camtoworlds[camera_ids, :3, 3]  # [nnz, 3]
+            masks = (radii > 0).all(dim=-1)  # [nnz]
+            if colors.dim() == 3:
+                # Turn [N, K, 3] into [nnz, 3]
+                shs = colors[gaussian_ids, :, :]  # [nnz, K, 3]
+            else:
+                # Turn [C, N, K, 3] into [nnz, 3]
+                shs = colors[camera_ids, gaussian_ids, :, :]  # [nnz, K, 3]
+            colors = spherical_harmonics(sh_degree, dirs, shs, masks=masks)  # [nnz, 3]
+        else:
+            dirs = means[None, :, :] - camtoworlds[:, None, :3, 3]  # [C, N, 3]
+            masks = (radii > 0).all(dim=-1)  # [C, N]
+            if colors.dim() == 3:
+                # Turn [N, K, 3] into [C, N, K, 3]
+                shs = colors.expand(C, -1, -1, -1)  # [C, N, K, 3]
+            else:
+                # colors is already [C, N, K, 3]
+                shs = colors
+            colors = spherical_harmonics(sh_degree, dirs, shs, masks=masks)  # [C, N, 3]
+        # make it apple-to-apple with Inria's CUDA Backend.
+        colors = torch.clamp_min(colors + 0.5, 0.0)
+
+    camtoworlds = torch.linalg.inv(viewmats)  # [C, 4, 4]
+    view2gaussians = view_to_gaussians(means, quats, scales, camtoworlds, radii)
+
+    integrated_colors, integrated_alphas = integrate_to_points(
+        points2d,
+        point_depths,
+        means2d,
+        conics,
+        colors,
+        opacities,
+        view2gaussians,
+        Ks,
+        width,
+        height,
+        tile_size,
+        isect_offsets,
+        flatten_ids,
+        point_isect_offsets,
+        point_flatten_ids,
+        backgrounds=backgrounds,
+        packed=packed,
+        absgrad=absgrad,
+    )
+    # breakpoint()
+
+    meta = {
+        "camera_ids": camera_ids,
+        "gaussian_ids": gaussian_ids,
+        "radii": radii,
+        "means2d": means2d,
+        "depths": depths,
+        "conics": conics,
+        "opacities": opacities,
+        "tile_width": tile_width,
+        "tile_height": tile_height,
+        "tiles_per_gauss": tiles_per_gauss,
+        "isect_ids": isect_ids,
+        "flatten_ids": flatten_ids,
+        "isect_offsets": isect_offsets,
+        "width": width,
+        "height": height,
+        "tile_size": tile_size,
+    }
+    return integrated_colors, integrated_alphas, meta

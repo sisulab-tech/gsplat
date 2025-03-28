@@ -12,6 +12,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import tqdm
+import trimesh
 import tyro
 import viser
 import yaml
@@ -29,16 +30,24 @@ from torch.utils.tensorboard import SummaryWriter
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import Literal, assert_never
-from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed
+from utils import (
+    AppearanceOptModule,
+    CameraOptModule,
+    create_tetrahedra_points,
+    knn,
+    rgb_to_sh,
+    set_random_seed,
+)
 
-from gsplat import export_splats
+from gsplat import compute_3D_smoothing_filter, export_splats, triangulate
 from gsplat.compression import PngCompression
 from gsplat.distributed import cli
 from gsplat.optimizers import SelectiveAdam
-from gsplat.rendering import rasterization
+from gsplat.rendering import integration, rasterization
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
+from gsplat.tetmesh import marching_tetrahedra
 
 
 @dataclass
@@ -87,8 +96,14 @@ class Config:
     save_ply: bool = False
     # Steps to save the model as ply
     ply_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    # Steps to run reconstruction and save as ply
+    recon_steps: List[int] = field(default_factory=lambda: [30_000])
     # Whether to disable video generation during training and evaluation
     disable_video: bool = False
+
+    # Wether to smooth depth with filters from GOF during reconstruction
+    recon_smooth_3d: bool = False
+    recon_opacity_threshold: float = 0.1
 
     # Initialization strategy
     init_type: str = "sfm"
@@ -305,6 +320,8 @@ class Runner:
         os.makedirs(self.render_dir, exist_ok=True)
         self.ply_dir = f"{cfg.result_dir}/ply"
         os.makedirs(self.ply_dir, exist_ok=True)
+        self.mesh_dir = f"{cfg.result_dir}/mesh"
+        os.makedirs(self.mesh_dir, exist_ok=True)
 
         # Tensorboard
         self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb")
@@ -691,7 +708,7 @@ class Runner:
 
             loss.backward()
 
-            desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
+            desc = f"loss={loss.item():.3f}| sh degree={sh_degree_to_use}| "
             if cfg.depth_loss:
                 desc += f"depth loss={depthloss.item():.6f}| "
             if cfg.pose_opt and cfg.pose_noise:
@@ -863,6 +880,9 @@ class Runner:
             # run compression
             if cfg.compression is not None and step in [i - 1 for i in cfg.eval_steps]:
                 self.run_compression(step=step)
+
+            if step in [i - 1 for i in cfg.recon_steps]:
+                self.recon(step)
 
             if not cfg.disable_viewer:
                 self.viewer.lock.release()
@@ -1122,6 +1142,216 @@ class Runner:
             )
         return renders
 
+    @torch.no_grad()
+    def compute_3D_smoothing_filter(self):
+        cfg = self.cfg
+        device = self.device
+        xyz = self.splats["means"]
+        print("xyz", xyz.shape, xyz.device)
+
+        worldtocams = (
+            torch.from_numpy(self.trainset.parser.worldtocams).float().to(device)
+        )
+        # TODO, currently use K, H, W of the first image
+        data = self.trainset[0]
+        K = data["K"].to(device)  # [3, 3]
+        height, width = data["image"].shape[:2]
+        Ks = torch.stack([K] * len(worldtocams), dim=0)  # [C, 3, 3]
+        filter_3D = compute_3D_smoothing_filter(
+            xyz, worldtocams, Ks, width, height, cfg.near_plane
+        )
+        valid_points = filter_3D < 1000000.0
+        filter_3D[~valid_points] = filter_3D[valid_points].max()
+        # 0.3 since we don't use anti-aliasing for gof at the moment
+        filter_3D = filter_3D * ((0.2 if self.cfg.antialiased else 0.3) ** 0.5)
+        self.splats["filters"] = torch.nn.Parameter(filter_3D)
+
+    def get_scale_opacity_with_smoothing_filer(self):
+        scales = torch.exp(self.splats["scales"])  # [N, 3]
+        opacities = torch.sigmoid(self.splats["opacities"])  # [N,]
+        filters = self.splats["filters"]  # [N,]
+
+        # apply 3D smoothing filter to scales and opacities
+        scales_square = torch.square(scales)  # [N, 3]
+        det1 = scales_square.prod(dim=1)  # [N, ]
+
+        scales_after_square = scales_square + torch.square(filters)[:, None]  # [N, 1]
+        det2 = scales_after_square.prod(dim=1)  # [N,]
+        coef = torch.sqrt(det1 / det2 + 1e-7)  # [N,]
+        opacities = opacities * coef
+
+        scales = torch.square(scales) + torch.square(filters)[:, None]  # [N, 3]
+        scales = torch.sqrt(scales)
+
+        return scales, opacities
+
+    @torch.no_grad()
+    def evaluate_alpha(self, points, return_color: bool = False, **kwargs):
+        device = self.device
+        means = self.splats["means"]  # [N, 3]
+        quats = self.splats["quats"]  # [N, 4]
+
+        if self.cfg.recon_smooth_3d:
+            scales, opacities = self.get_scale_opacity_with_smoothing_filer()
+        else:
+            scales = torch.exp(self.splats["scales"])  # [N, 3]
+            opacities = torch.sigmoid(self.splats["opacities"])  # [N,]
+
+        colors = torch.cat([self.splats["sh0"], self.splats["shN"]], 1)  # [N, K, 3]
+        rasterize_mode = "antialiased" if self.cfg.antialiased else "classic"
+
+        trainloader = torch.utils.data.DataLoader(
+            self.trainset, batch_size=1, shuffle=False, num_workers=1
+        )
+
+        final_alpha = torch.ones((points.shape[0]), dtype=torch.float32, device=device)
+        if return_color:
+            final_color = torch.ones(
+                (points.shape[0], 3), dtype=torch.float32, device=device
+            )
+
+        for i, data in enumerate(trainloader):
+            camtoworlds = data["camtoworld"].to(device)
+            Ks = data["K"].to(device)
+            pixels = data["image"].to(device) / 255.0
+            height, width = pixels.shape[1:3]
+
+            render_colors, render_alphas, info = integration(
+                points=points,
+                means=means,
+                quats=quats,
+                scales=scales,
+                opacities=opacities,
+                colors=colors,
+                viewmats=torch.linalg.inv(camtoworlds),  # [C, 4, 4]
+                Ks=Ks,  # [C, 3, 3]
+                width=width,
+                height=height,
+                packed=False,
+                absgrad=False,
+                sparse_grad=False,
+                rasterize_mode=rasterize_mode,
+                sh_degree=self.cfg.sh_degree,
+                **kwargs,
+            )
+            assert render_alphas.shape[0] == 1
+            if return_color:
+                final_color = torch.where(
+                    (render_alphas < final_alpha).reshape(-1, 1),
+                    render_colors[0],
+                    final_color,
+                )
+            final_alpha = torch.min(final_alpha, render_alphas.reshape(-1))
+        alpha = 1 - final_alpha
+
+        if return_color:
+            return alpha, final_color
+        return alpha
+
+    @torch.no_grad()
+    def recon(self, step: int):
+        mesh_dir = self.mesh_dir
+
+        means = self.splats["means"]  # [N, 3]
+        quats = self.splats["quats"]  # [N, 4]
+
+        if self.cfg.recon_smooth_3d:
+            self.compute_3D_smoothing_filter()
+            scales, opacities = self.get_scale_opacity_with_smoothing_filer()
+        else:
+            scales = torch.exp(self.splats["scales"])  # [N, 3]
+            opacities = torch.sigmoid(self.splats["opacities"])  # [N,]
+
+        points, points_scale = create_tetrahedra_points(
+            quats=quats,
+            xyz=means,
+            scale=scales,
+            opacity=opacities,
+            opacity_threshold=self.cfg.recon_opacity_threshold,
+        )
+
+        cells_path = f"{mesh_dir}/cells_{step}.pt"
+        if not os.path.exists(cells_path):
+            print("create cells and save")
+            cells = triangulate(points)
+            # print("save cells", cells.shape)
+            torch.save(cells, cells_path)
+        else:
+            # load cells
+            print("load cells")
+            cells = torch.load(cells_path)
+
+        tets = cells.cpu().long()
+        del cells
+
+        alpha = self.evaluate_alpha(points)
+        assert isinstance(alpha, Tensor)
+
+        print(f"{points.shape=}, {tets.shape=}, {alpha.shape=}")
+
+        def alpha_to_sdf(alpha):
+            sdf = alpha - 0.5
+            sdf = sdf[None]
+            return sdf
+
+        sdf = alpha_to_sdf(alpha)
+
+        torch.cuda.empty_cache()
+        verts_list, scale_list, faces_list, _ = marching_tetrahedra(
+            points[None].cpu(), tets.cpu(), sdf.cpu(), points_scale[None].cpu()
+        )
+        del tets, sdf, points_scale
+        torch.cuda.empty_cache()
+
+        end_points, end_sdf = verts_list[0]
+        end_scales = scale_list[0]
+
+        faces = faces_list[0].cpu().numpy()
+        points = (end_points[:, 0, :] + end_points[:, 1, :]) / 2.0
+
+        left_points = end_points[:, 0, :]
+        right_points = end_points[:, 1, :]
+        left_sdf = end_sdf[:, 0, :]
+        right_sdf = end_sdf[:, 1, :]
+        left_scale = end_scales[:, 0, 0]
+        right_scale = end_scales[:, 1, 0]
+        distance = torch.norm(left_points - right_points, dim=-1)
+        scale = left_scale + right_scale
+
+        n_binary_steps = 8
+        for binary_step in tqdm.trange(n_binary_steps, desc="recon binary search"):
+            mid_points = (left_points + right_points) / 2
+            alpha = self.evaluate_alpha(mid_points.cuda()).cpu()
+            mid_sdf = alpha_to_sdf(alpha).squeeze().unsqueeze(-1)
+
+            ind_low = ((mid_sdf < 0) & (left_sdf < 0)) | (
+                (mid_sdf > 0) & (left_sdf > 0)
+            )
+
+            left_sdf[ind_low] = mid_sdf[ind_low]
+            right_sdf[~ind_low] = mid_sdf[~ind_low]
+            left_points[ind_low.flatten()] = mid_points[ind_low.flatten()]
+            right_points[~ind_low.flatten()] = mid_points[~ind_low.flatten()]
+
+            points = (left_points + right_points) / 2
+
+        _, color = self.evaluate_alpha(points.cuda(), return_color=True)
+        vertex_colors = (color.cpu().numpy() * 255).astype(np.uint8)
+
+        mesh = trimesh.Trimesh(
+            vertices=points.cpu().numpy(),
+            faces=faces,
+            vertex_colors=vertex_colors,
+            process=False,
+        )
+        mesh.export(f"{mesh_dir}/recon_{step}.ply")
+
+        mask = (distance <= scale).cpu().numpy()
+        face_mask = mask[faces].all(axis=1)
+        mesh.update_vertices(mask)
+        mesh.update_faces(face_mask)
+        mesh.export(f"{mesh_dir}/recon_{step}_filtered.ply")
+
 
 def main(local_rank: int, world_rank, world_size: int, cfg: Config):
     if world_size > 1 and not cfg.disable_viewer:
@@ -1144,6 +1374,7 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
         runner.render_traj(step=step)
         if cfg.compression is not None:
             runner.run_compression(step=step)
+        runner.recon(step=step)
     else:
         runner.train()
 

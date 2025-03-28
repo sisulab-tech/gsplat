@@ -35,6 +35,7 @@ namespace gsplat {
 using vec2 = glm::vec<2, float>;
 using vec3 = glm::vec<3, float>;
 using vec4 = glm::vec<4, float>;
+using vec10 = std::array<float, 10>;
 using mat2 = glm::mat<2, 2, float>;
 using mat3 = glm::mat<3, 3, float>;
 using mat4 = glm::mat<4, 4, float>;

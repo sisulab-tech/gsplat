@@ -88,5 +88,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def_readwrite("in_image_margin_factor", &UnscentedTransformParameters::in_image_margin_factor)
         .def_readwrite("require_all_sigma_points_valid", &UnscentedTransformParameters::require_all_sigma_points_valid);
 
+    m.def(
+        "compute_3D_smoothing_filter_fwd",
+        &gsplat::compute_3D_smoothing_filter_fwd_tensor
+    );
+    m.def("project_points_fwd", &gsplat::project_points_fwd_tensor);
+    m.def("points_isect_tiles", &gsplat::points_isect_tiles_tensor);
+    m.def("integrate_to_points_fwd", &gsplat::integrate_to_points_fwd_tensor);
+    m.def("view_to_gaussians_fwd", &gsplat::view_to_gaussians_fwd_tensor);
 
+    // tetra-nerf
+    m.def("triangulate", &gsplat::py_triangulate);
 }
