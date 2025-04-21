@@ -1197,7 +1197,25 @@ class Runner:
             scales = torch.exp(self.splats["scales"])  # [N, 3]
             opacities = torch.sigmoid(self.splats["opacities"])  # [N,]
 
-        colors = torch.cat([self.splats["sh0"], self.splats["shN"]], 1)  # [N, K, 3]
+        sh_degree = self.cfg.sh_degree
+        if self.cfg.app_opt:
+            # eval at origin to bake the appeareance into the colors
+            rgb = self.app_module(
+                features=self.splats["features"],
+                embed_ids=None,
+                dirs=torch.zeros_like(self.splats["means"][None, :, :]),
+                sh_degree=sh_degree,
+            )
+            rgb = rgb + self.splats["colors"]
+            rgb = torch.sigmoid(rgb).squeeze(0).unsqueeze(1)
+            sh0 = rgb_to_sh(rgb)
+            shN = torch.empty([sh0.shape[0], 0, 3], device=sh0.device)
+            sh_degree = 0
+        else:
+            sh0 = self.splats["sh0"]
+            shN = self.splats["shN"]
+        colors = torch.cat([sh0, shN], 1)  # [N, K, 3]
+
         rasterize_mode = "antialiased" if self.cfg.antialiased else "classic"
 
         trainloader = torch.utils.data.DataLoader(
@@ -1228,10 +1246,14 @@ class Runner:
                 width=width,
                 height=height,
                 packed=False,
-                absgrad=False,
-                sparse_grad=False,
+                absgrad=(
+                    self.cfg.strategy.absgrad
+                    if isinstance(self.cfg.strategy, DefaultStrategy)
+                    else False
+                ),
+                sparse_grad=self.cfg.sparse_grad,
                 rasterize_mode=rasterize_mode,
-                sh_degree=self.cfg.sh_degree,
+                sh_degree=sh_degree,
                 **kwargs,
             )
             assert render_alphas.shape[0] == 1
