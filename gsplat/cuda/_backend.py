@@ -1,4 +1,4 @@
-""" 
+"""
 Trigger compiling (for debugging):
 
 VERBOSE=1 FAST_COMPILE=1 TORCH_CUDA_ARCH_LIST="8.9" python -c "from gsplat.cuda._backend import _C"
@@ -14,9 +14,9 @@ from subprocess import DEVNULL, call
 import torch
 from packaging import version
 from rich.console import Console
-from torch.utils.cpp_extension import _find_cuda_home  # <--- For robust CUDA detection
 from torch.utils.cpp_extension import (
     _TORCH_PATH,
+    _find_cuda_home,  # <--- For robust CUDA detection
     _get_build_directory,
     _import_module_from_library,
     _jit_compile,
@@ -157,6 +157,14 @@ except ImportError:
             + list(glob.glob(os.path.join(PATH, "csrc/*.cpp")))
             + [os.path.join(PATH, "ext.cpp")]
         )
+        # For meshing
+        extra_ldflags = [
+            "-L" + os.path.join(os.environ["CONDA_ENV_DIR"], "lib"),
+            "-lgmp", # GMP
+        ]
+        extra_include_paths.append(
+            os.path.join(os.environ["CONDA_ENV_DIR"], "include") # CGAL
+        )
 
         # If JIT is interrupted it might leave a lock in the build directory.
         # We dont want it to exist in any case.
@@ -176,6 +184,7 @@ except ImportError:
                 extra_cflags=extra_cflags,
                 extra_cuda_cflags=extra_cuda_cflags,
                 extra_include_paths=extra_include_paths,
+                extra_ldflags=extra_ldflags,
                 build_directory=build_dir,
                 verbose=VERBOSE,
             )
@@ -194,6 +203,7 @@ except ImportError:
                     extra_cflags=extra_cflags,
                     extra_cuda_cflags=extra_cuda_cflags,
                     extra_include_paths=extra_include_paths,
+                    extra_ldflags=extra_ldflags,
                     build_directory=build_dir,
                     verbose=VERBOSE,
                 )

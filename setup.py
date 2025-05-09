@@ -90,6 +90,13 @@ def get_extensions():
     glm_path = osp.join(current_dir, "gsplat", "cuda", "csrc", "third_party", "glm")
     include_dirs = [glm_path, osp.join(current_dir, "gsplat", "cuda", "include")]
 
+    library_dirs = []
+
+    # For meshing
+    if "CONDA_ENV_PATH" in os.environ:
+        include_dirs.append(osp.join(os.environ["CONDA_ENV_DIR"], "include"))
+        library_dirs.append(osp.join(os.environ["CONDA_ENV_DIR"], "lib"))
+
     extension = CUDAExtension(
         "gsplat.csrc",
         sources,
@@ -98,6 +105,7 @@ def get_extensions():
         undef_macros=undef_macros,
         extra_compile_args=extra_compile_args,
         extra_link_args=extra_link_args,
+        library_dirs=library_dirs,
     )
     return [extension]
 

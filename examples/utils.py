@@ -1,12 +1,13 @@
 import random
 
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn.functional as F
+import trimesh
+from matplotlib import colormaps
 from sklearn.neighbors import NearestNeighbors
 from torch import Tensor
-import torch.nn.functional as F
-import matplotlib.pyplot as plt
-from matplotlib import colormaps
 
 
 class CameraOptModule(torch.nn.Module):
@@ -222,3 +223,61 @@ def apply_depth_colormap(
     if acc is not None:
         img = img * acc + (1.0 - acc)
     return img
+
+
+def create_tetrahedra_points(quats, xyz, scale, opacity=None, opacity_threshold=0.1):
+    device = xyz.device
+
+    M = trimesh.creation.box(extents=[2.0, 2.0, 2.0])
+
+    quats = F.normalize(quats, p=2, dim=-1)
+    w, x, y, z = torch.unbind(quats, dim=-1)
+    R = torch.stack(
+        [
+            1 - 2 * (y**2 + z**2),
+            2 * (x * y - w * z),
+            2 * (x * z + w * y),
+            2 * (x * y + w * z),
+            1 - 2 * (x**2 + z**2),
+            2 * (y * z - w * x),
+            2 * (x * z - w * y),
+            2 * (y * z + w * x),
+            1 - 2 * (x**2 + y**2),
+        ],
+        dim=-1,
+    )
+
+    rots = R.reshape(quats.shape[:-1] + (3, 3))  # (..., 3, 3)
+    scale = scale * 3.0  # scale up the box at 3 sigma
+
+    # filter points with small opacity
+    if opacity is not None:
+        mask = (opacity > opacity_threshold).squeeze(-1)
+        xyz = xyz[mask]
+        scale = scale[mask]
+        rots = rots[mask]
+
+    vertices = M.vertices.T
+    vertices = (
+        torch.from_numpy(vertices)
+        .float()
+        .to(device)
+        .unsqueeze(0)
+        .repeat(xyz.shape[0], 1, 1)
+    )
+    # scale vertices first
+    vertices = vertices * scale.unsqueeze(-1)
+    vertices = torch.bmm(rots, vertices).squeeze(-1) + xyz.unsqueeze(-1)
+    vertices = vertices.permute(0, 2, 1).reshape(-1, 3).contiguous()
+    # concat center points
+    vertices = torch.cat([vertices, xyz], dim=0)
+
+    # scale is not a good solution but use it for now
+    scale = scale.max(dim=-1, keepdim=True)[0]
+    scale_corner = scale.repeat(1, 8).reshape(-1, 1)
+    vertices_scale = torch.cat([scale_corner, scale], dim=0)
+
+    # Mask out vertices outside of context views
+    # TODO(@sercant): missing frustum masking
+
+    return vertices, vertices_scale
