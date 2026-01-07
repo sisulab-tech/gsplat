@@ -103,9 +103,14 @@ def main(local_rank: int, world_rank, world_size: int, args):
         means, quats, scales, opacities, sh0, shN = [], [], [], [], [], []
         for ckpt_path in args.ckpt:
             ckpt = torch.load(ckpt_path, map_location=device)["splats"]
-            means.append(ckpt["means"])
+            if "w" in ckpt:
+                w_inv = 1.0 / torch.exp(ckpt["w"]).unsqueeze(1)
+                means.append(ckpt["means"] * w_inv)
+                scales.append(torch.exp(ckpt["scales"]) * w_inv)
+            else:
+                means.append(ckpt["means"])
+                scales.append(torch.exp(ckpt["scales"]))
             quats.append(F.normalize(ckpt["quats"], p=2, dim=-1))
-            scales.append(torch.exp(ckpt["scales"]))
             opacities.append(torch.sigmoid(ckpt["opacities"]))
             sh0.append(ckpt["sh0"])
             shN.append(ckpt["shN"])
@@ -252,7 +257,7 @@ if __name__ == "__main__":
         --ckpt results/garden/ckpts/ckpt_6999_rank0.pt \
         --output_dir results/garden/ \
         --port 8082
-    
+
     CUDA_VISIBLE_DEVICES=9 python -m simple_viewer \
         --output_dir results/garden/ \
         --port 8082
