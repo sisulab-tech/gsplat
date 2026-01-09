@@ -33,6 +33,9 @@ __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
     const uint32_t tile_height,
     const int32_t *__restrict__ tile_offsets, // [C, tile_height, tile_width]
     const int32_t *__restrict__ flatten_ids,  // [n_isects]
+    // FastGS: metric accumulation parameters
+    const bool *__restrict__ metric_map,      // [C, image_height, image_width] or nullptr
+    int32_t *__restrict__ metric_counts,      // [N] or nullptr
     scalar_t
         *__restrict__ render_colors, // [C, image_height, image_width, CDIM]
     scalar_t *__restrict__ render_alphas, // [C, image_height, image_width, 1]
@@ -57,6 +60,10 @@ __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
     }
     if (masks != nullptr) {
         masks += camera_id * tile_height * tile_width;
+    }
+    // FastGS: offset metric_map pointer to current camera
+    if (metric_map != nullptr) {
+        metric_map += camera_id * image_height * image_width;
     }
 
     float px = (float)j + 0.5f;
@@ -165,6 +172,15 @@ __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
             }
             cur_idx = batch_start + t;
 
+            // FastGS: accumulate metric counts if this pixel is flagged
+            if (metric_map != nullptr && metric_counts != nullptr && inside) {
+                if (metric_map[pix_id]) {
+                    // Convert g to original Gaussian index (handle packed vs unpacked)
+                    int32_t gauss_idx = packed ? g : (g % N);
+                    atomicAdd(&metric_counts[gauss_idx], 1);
+                }
+            }
+
             T = next_T;
         }
     }
@@ -203,6 +219,9 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
     // intersections
     const at::Tensor tile_offsets, // [C, tile_height, tile_width]
     const at::Tensor flatten_ids,  // [n_isects]
+    // FastGS: metric accumulation
+    const at::optional<at::Tensor> metric_map,    // [C, image_height, image_width]
+    const at::optional<at::Tensor> metric_counts, // [N]
     // outputs
     at::Tensor renders, // [C, image_height, image_width, channels]
     at::Tensor alphas,  // [C, image_height, image_width]
@@ -259,6 +278,9 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
             tile_height,
             tile_offsets.data_ptr<int32_t>(),
             flatten_ids.data_ptr<int32_t>(),
+            // FastGS: metric accumulation
+            metric_map.has_value() ? metric_map.value().data_ptr<bool>() : nullptr,
+            metric_counts.has_value() ? metric_counts.value().data_ptr<int32_t>() : nullptr,
             renders.data_ptr<float>(),
             alphas.data_ptr<float>(),
             last_ids.data_ptr<int32_t>()
@@ -281,6 +303,8 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
         uint32_t tile_size,                                                    \
         const at::Tensor tile_offsets,                                         \
         const at::Tensor flatten_ids,                                          \
+        const at::optional<at::Tensor> metric_map,                             \
+        const at::optional<at::Tensor> metric_counts,                          \
         at::Tensor renders,                                                    \
         at::Tensor alphas,                                                     \
         at::Tensor last_ids                                                    \

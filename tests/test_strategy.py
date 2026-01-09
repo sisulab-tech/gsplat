@@ -15,7 +15,7 @@ device = torch.device("cuda:0")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="No CUDA device")
 def test_strategy():
     from gsplat.rendering import rasterization
-    from gsplat.strategy import DefaultStrategy, MCMCStrategy
+    from gsplat.strategy import DefaultStrategy, FastGSStrategy, MCMCStrategy
 
     torch.manual_seed(42)
 
@@ -60,6 +60,33 @@ def test_strategy():
     state = strategy.initialize_state()
     render_colors.mean().backward(retain_graph=True)
     strategy.step_post_backward(params, optimizers, state, step=600, info=info, lr=1e-3)
+
+    # Test FastGSStrategy - need to re-render with updated params
+    strategy = FastGSStrategy(verbose=True)
+    strategy.check_sanity(params, optimizers)
+    state = strategy.initialize_state()
+
+    # Re-render with the current (modified) params since DefaultStrategy changed N
+    render_colors_fastgs, _, info_fastgs = rasterization(
+        means=params["means"],
+        quats=params["quats"],
+        scales=torch.exp(params["scales"]),
+        opacities=torch.sigmoid(params["opacities"]),
+        colors=params["colors"],
+        viewmats=torch.eye(4).unsqueeze(0).to(device),
+        Ks=torch.eye(3).unsqueeze(0).to(device),
+        width=10,
+        height=10,
+        packed=False,
+    )
+
+    strategy.step_pre_backward(params, optimizers, state, step=600, info=info_fastgs)
+    render_colors_fastgs.mean().backward(retain_graph=True)
+    # FastGS needs cameras and trainset, but they're optional for basic testing
+    strategy.step_post_backward(
+        params, optimizers, state, step=600, info=info_fastgs,
+        cameras=None, trainset=None
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="No CUDA device")

@@ -159,11 +159,11 @@ except ImportError:
         )
         # For meshing
         extra_ldflags = [
-            "-L" + os.path.join(os.environ["CONDA_ENV_DIR"], "lib"),
+            "-L" + os.path.abspath(os.path.join(os.environ["CONDA_ENV_DIR"], "lib")),
             "-lgmp", # GMP
         ]
         extra_include_paths.append(
-            os.path.join(os.environ["CONDA_ENV_DIR"], "include") # CGAL
+            os.path.abspath(os.path.join(os.environ["CONDA_ENV_DIR"], "include")) # CGAL
         )
 
         # If JIT is interrupted it might leave a lock in the build directory.

@@ -495,6 +495,9 @@ def rasterize_to_pixels(
     masks: Optional[Tensor] = None,  # [C, tile_height, tile_width]
     packed: bool = False,
     absgrad: bool = False,
+    # FastGS: metric accumulation
+    metric_map: Optional[Tensor] = None,  # [C, image_height, image_width]
+    metric_counts: Optional[Tensor] = None,  # [N]
 ) -> Tuple[Tensor, Tensor]:
     """Rasterizes Gaussians to pixels.
 
@@ -512,6 +515,8 @@ def rasterize_to_pixels(
         masks: Optional tile mask to skip rendering GS to masked tiles. [C, tile_height, tile_width]. Default: None.
         packed: If True, the input tensors are expected to be packed with shape [nnz, ...]. Default: False.
         absgrad: If True, the backward pass will compute a `.absgrad` attribute for `means2d`. Default: False.
+        metric_map: (FastGS) Binary mask of pixels to accumulate metrics for. [C, image_height, image_width]. Default: None.
+        metric_counts: (FastGS) Tensor to accumulate per-Gaussian counts. [N]. Default: None.
 
     Returns:
         A tuple:
@@ -609,6 +614,8 @@ def rasterize_to_pixels(
         isect_offsets.contiguous(),
         flatten_ids.contiguous(),
         absgrad,
+        metric_map.contiguous() if metric_map is not None else None,  # FastGS
+        metric_counts,  # FastGS
     )
 
     if padded_channels > 0:
@@ -1135,8 +1142,11 @@ class _RasterizeToPixels(torch.autograd.Function):
         isect_offsets: Tensor,  # [C, tile_height, tile_width]
         flatten_ids: Tensor,  # [n_isects]
         absgrad: bool,
+        # FastGS: metric accumulation
+        metric_map: Optional[Tensor] = None,  # [C, image_height, image_width]
+        metric_counts: Optional[Tensor] = None,  # [N]
     ) -> Tuple[Tensor, Tensor]:
-        render_colors, render_alphas, last_ids = _make_lazy_cuda_func(
+        render_colors, render_alphas, last_ids, metric_counts_out = _make_lazy_cuda_func(
             "rasterize_to_pixels_3dgs_fwd"
         )(
             means2d,
@@ -1150,6 +1160,8 @@ class _RasterizeToPixels(torch.autograd.Function):
             tile_size,
             isect_offsets,
             flatten_ids,
+            metric_map,
+            metric_counts,
         )
 
         ctx.save_for_backward(
@@ -1168,6 +1180,8 @@ class _RasterizeToPixels(torch.autograd.Function):
         ctx.height = height
         ctx.tile_size = tile_size
         ctx.absgrad = absgrad
+        # FastGS: save metric_counts_out for potential use
+        ctx.metric_counts_out = metric_counts_out
 
         # double to float
         render_alphas = render_alphas.float()
@@ -1237,13 +1251,15 @@ class _RasterizeToPixels(torch.autograd.Function):
             v_colors,
             v_opacities,
             v_backgrounds,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            None,  # masks
+            None,  # width
+            None,  # height
+            None,  # tile_size
+            None,  # isect_offsets
+            None,  # flatten_ids
+            None,  # absgrad
+            None,  # metric_map (FastGS)
+            None,  # metric_counts (FastGS)
         )
 
 
@@ -2559,6 +2575,91 @@ def points_isect_tiles(
         tile_size,
         tile_width,
         tile_height,
+        sort,
+        True,  # DoubleBuffer: memory efficient radixsort
+    )
+    return isect_ids, flatten_ids
+
+
+@torch.no_grad()
+def points_isect_tiles_compact_box(
+    means2d: Tensor,  # [C, N, 2] or [nnz, 2]
+    conics: Tensor,  # [C, N, 3] or [nnz, 3]
+    opacities: Tensor,  # [C, N] or [nnz]
+    depths: Tensor,  # [C, N] or [nnz]
+    tile_size: int,
+    tile_width: int,
+    tile_height: int,
+    compact_box_mult: float = 0.5,
+    sort: bool = True,
+    packed: bool = False,
+    n_cameras: Optional[int] = None,
+    camera_ids: Optional[Tensor] = None,
+    gaussian_ids: Optional[Tensor] = None,
+) -> Tuple[Tensor, Tensor]:
+    """Maps projected Gaussians to intersecting tiles using Compact Box.
+
+    This function uses precise ellipse-tile intersection based on Mahalanobis distance
+    filtering, as described in the FastGS paper. It reduces the number of Gaussian-tile
+    pairs compared to simple rectangular bounding boxes, leading to faster rasterization.
+
+    Args:
+        means2d: Projected Gaussian means. [C, N, 2] if packed is False, [nnz, 2] if packed is True.
+        conics: Inverse of the projected covariances with only upper triangle values.
+            [C, N, 3] if packed is False, [nnz, 3] if packed is True.
+        opacities: Per-view Gaussian opacities. [C, N] if packed is False, [nnz] if packed is True.
+        depths: Z-depth of the projected Gaussians. [C, N] if packed is False, [nnz] if packed is True.
+        tile_size: Tile size.
+        tile_width: Tile width.
+        tile_height: Tile height.
+        compact_box_mult: Multiplier for the Mahalanobis distance threshold. Default: 0.5.
+            Smaller values result in tighter bounding boxes and fewer tile intersections.
+        sort: If True, the returned intersections will be sorted by the intersection ids. Default: True.
+        packed: If True, the input tensors are packed. Default: False.
+        n_cameras: Number of cameras. Required if packed is True.
+        camera_ids: The row indices of the projected Gaussians. Required if packed is True.
+        gaussian_ids: The column indices of the projected Gaussians. Required if packed is True.
+
+    Returns:
+        A tuple:
+
+        - **Intersection ids**. Each id is an 64-bit integer with the following
+          information: camera_id (Xc bits) | tile_id (Xt bits) | depth (32 bits).
+          Xc and Xt are the maximum number of bits required to represent the camera and
+          tile ids, respectively. Int64 [n_isects]
+        - **Flatten ids**. The global flatten indices in [C * N] or [nnz] (packed). [n_isects]
+    """
+    if packed:
+        nnz = means2d.size(0)
+        assert means2d.shape == (nnz, 2), means2d.size()
+        assert conics.shape == (nnz, 3), conics.size()
+        assert opacities.shape == (nnz,), opacities.size()
+        assert depths.shape == (nnz,), depths.size()
+        assert camera_ids is not None, "camera_ids is required if packed is True"
+        assert gaussian_ids is not None, "gaussian_ids is required if packed is True"
+        assert n_cameras is not None, "n_cameras is required if packed is True"
+        camera_ids = camera_ids.contiguous()
+        gaussian_ids = gaussian_ids.contiguous()
+        C = n_cameras
+    else:
+        C, N, _ = means2d.shape
+        assert means2d.shape == (C, N, 2), means2d.size()
+        assert conics.shape == (C, N, 3), conics.size()
+        assert opacities.shape == (C, N), opacities.size()
+        assert depths.shape == (C, N), depths.size()
+
+    isect_ids, flatten_ids = _make_lazy_cuda_func("points_isect_tiles_cb")(
+        means2d.contiguous(),
+        conics.contiguous(),
+        opacities.contiguous(),
+        depths.contiguous(),
+        camera_ids,
+        gaussian_ids,
+        C,
+        tile_size,
+        tile_width,
+        tile_height,
+        compact_box_mult,
         sort,
         True,  # DoubleBuffer: memory efficient radixsort
     )

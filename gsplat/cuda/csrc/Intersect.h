@@ -46,4 +46,21 @@ void radix_sort_double_buffer(
     at::Tensor flatten_ids_sorted
 );
 
+// Compact Box: Precise ellipse-tile intersection using Mahalanobis distance
+std::tuple<at::Tensor, at::Tensor> points_isect_tiles_cb_tensor(
+    const at::Tensor means2d,                    // [C, N, 2] or [nnz, 2]
+    const at::Tensor conics,                     // [C, N, 3] or [nnz, 3]
+    const at::Tensor opacities,                  // [C, N] or [nnz]
+    const at::Tensor depths,                     // [C, N] or [nnz]
+    const at::optional<at::Tensor> camera_ids,   // [nnz]
+    const at::optional<at::Tensor> gaussian_ids, // [nnz]
+    const uint32_t C,
+    const uint32_t tile_size,
+    const uint32_t tile_width,
+    const uint32_t tile_height,
+    const float compact_box_mult,
+    const bool sort,
+    const bool double_buffer
+);
+
 } // namespace gsplat

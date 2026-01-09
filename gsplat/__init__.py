@@ -11,6 +11,7 @@ from .cuda._wrapper import (
     fully_fused_projection_with_ut,
     isect_offset_encode,
     isect_tiles,
+    points_isect_tiles_compact_box,
     proj,
     quat_scale_to_covar_preci,
     rasterize_to_indices_in_range,
@@ -30,12 +31,13 @@ from .rendering import (
     rasterization_2dgs_inria_wrapper,
     rasterization_inria_wrapper,
 )
-from .strategy import DefaultStrategy, MCMCStrategy, Strategy
+from .strategy import DefaultStrategy, FastGSStrategy, MCMCStrategy, Strategy
 from .version import __version__
 
 all = [
     "PngCompression",
     "DefaultStrategy",
+    "FastGSStrategy",
     "MCMCStrategy",
     "Strategy",
     "rasterization",
@@ -44,6 +46,7 @@ all = [
     "spherical_harmonics",
     "isect_offset_encode",
     "isect_tiles",
+    "points_isect_tiles_compact_box",
     "proj",
     "fully_fused_projection",
     "quat_scale_to_covar_preci",

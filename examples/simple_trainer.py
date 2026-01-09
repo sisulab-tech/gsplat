@@ -44,7 +44,7 @@ from gsplat.compression import PngCompression
 from gsplat.distributed import cli
 from gsplat.optimizers import SelectiveAdam
 from gsplat.rendering import integration, rasterization
-from gsplat.strategy import DefaultStrategy, MCMCStrategy
+from gsplat.strategy import DefaultStrategy, FastGSStrategy, MCMCStrategy
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
 from gsplat.tetmesh import marching_tetrahedra
@@ -128,7 +128,7 @@ class Config:
     far_plane: float = 1e10
 
     # Strategy for GS densification
-    strategy: Union[DefaultStrategy, MCMCStrategy] = field(
+    strategy: Union[DefaultStrategy, FastGSStrategy, MCMCStrategy] = field(
         default_factory=DefaultStrategy
     )
     # Use packed mode for rasterization, this leads to less memory usage but slightly slower.
@@ -139,6 +139,18 @@ class Config:
     visible_adam: bool = False
     # Anti-aliasing in rasterization. Might slightly hurt quantitative metrics.
     antialiased: bool = False
+
+    # FastGS: Optimizer scheduling to reduce frequency in later training stages
+    # When enabled, optimizer steps are reduced: ≤15K: every 1, 15K-20K: every 32, >20K: every 64
+    optimizer_schedule: bool = False
+    optimizer_schedule_start: int = 15_000  # Start reducing frequency after this step
+    optimizer_schedule_mid: int = 20_000    # Further reduce frequency after this step
+    optimizer_schedule_freq1: int = 32      # Frequency for mid-stage (15K-20K)
+    optimizer_schedule_freq2: int = 64      # Frequency for late-stage (>20K)
+
+    # FastGS: Compact Box for precise tile intersection (reduces Gaussian-tile pairs by ~14%)
+    use_compact_box: bool = False
+    compact_box_mult: float = 0.5  # Mahalanobis distance multiplier (0.5 is FastGS default)
 
     # Use random background for training to discourage transparency
     random_bkgd: bool = False
@@ -204,6 +216,14 @@ class Config:
             strategy.refine_start_iter = int(strategy.refine_start_iter * factor)
             strategy.refine_stop_iter = int(strategy.refine_stop_iter * factor)
             strategy.refine_every = int(strategy.refine_every * factor)
+        elif isinstance(strategy, FastGSStrategy):
+            strategy.refine_start_iter = int(strategy.refine_start_iter * factor)
+            strategy.refine_stop_iter = int(strategy.refine_stop_iter * factor)
+            strategy.refine_every = int(strategy.refine_every * factor)
+            strategy.final_prune_start = int(strategy.final_prune_start * factor)
+            strategy.final_prune_stop = int(strategy.final_prune_stop * factor)
+            strategy.final_prune_every = int(strategy.final_prune_every * factor)
+            strategy.reset_every = int(strategy.reset_every * factor)
         else:
             assert_never(strategy)
 
@@ -371,6 +391,10 @@ class Runner:
             self.strategy_state = self.cfg.strategy.initialize_state(
                 scene_scale=self.scene_scale
             )
+        elif isinstance(self.cfg.strategy, FastGSStrategy):
+            self.strategy_state = self.cfg.strategy.initialize_state(
+                scene_scale=self.scene_scale
+            )
         elif isinstance(self.cfg.strategy, MCMCStrategy):
             self.strategy_state = self.cfg.strategy.initialize_state()
         else:
@@ -517,6 +541,7 @@ class Runner:
             packed=self.cfg.packed,
             absgrad=(
                 self.cfg.strategy.absgrad
+                # if isinstance(self.cfg.strategy, (DefaultStrategy, FastGSStrategy))
                 if isinstance(self.cfg.strategy, DefaultStrategy)
                 else False
             ),
@@ -832,23 +857,45 @@ class Runner:
                     visibility_mask = (info["radii"] > 0).all(-1).any(0)
 
             # optimize
-            for optimizer in self.optimizers.values():
-                if cfg.visible_adam:
-                    optimizer.step(visibility_mask)
-                else:
+            # FastGS: Optimizer scheduling to reduce update frequency in later stages
+            should_step_optimizer = True
+            if cfg.optimizer_schedule:
+                if step > cfg.optimizer_schedule_mid:
+                    # Late stage (>20K): step every 64 iterations
+                    should_step_optimizer = (step % cfg.optimizer_schedule_freq2 == 0)
+                elif step > cfg.optimizer_schedule_start:
+                    # Mid stage (15K-20K): step every 32 iterations
+                    should_step_optimizer = (step % cfg.optimizer_schedule_freq1 == 0)
+                # Early stage (≤15K): step every iteration (default)
+
+            if should_step_optimizer:
+                for optimizer in self.optimizers.values():
+                    if cfg.visible_adam:
+                        optimizer.step(visibility_mask)
+                    else:
+                        optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+                for optimizer in self.pose_optimizers:
                     optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-            for optimizer in self.pose_optimizers:
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-            for optimizer in self.app_optimizers:
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-            for optimizer in self.bil_grid_optimizers:
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-            for scheduler in schedulers:
-                scheduler.step()
+                    optimizer.zero_grad(set_to_none=True)
+                for optimizer in self.app_optimizers:
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+                for optimizer in self.bil_grid_optimizers:
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+                for scheduler in schedulers:
+                    scheduler.step()
+            else:
+                # Still need to zero gradients even if not stepping
+                for optimizer in self.optimizers.values():
+                    optimizer.zero_grad(set_to_none=True)
+                for optimizer in self.pose_optimizers:
+                    optimizer.zero_grad(set_to_none=True)
+                for optimizer in self.app_optimizers:
+                    optimizer.zero_grad(set_to_none=True)
+                for optimizer in self.bil_grid_optimizers:
+                    optimizer.zero_grad(set_to_none=True)
 
             # Run post-backward steps after backward and optimizer
             if isinstance(self.cfg.strategy, DefaultStrategy):
@@ -859,6 +906,28 @@ class Runner:
                     step=step,
                     info=info,
                     packed=cfg.packed,
+                )
+            elif isinstance(self.cfg.strategy, FastGSStrategy):
+                # FastGS requires cameras and trainset for multi-view score computation
+                # Prepare camera dict with current training camera data
+                camera_dict = {
+                    "camtoworlds": camtoworlds,  # [1, 4, 4]
+                    "Ks": Ks,  # [1, 3, 3]
+                    "width": width,
+                    "height": height,
+                    "sh_degree": sh_degree_to_use,
+                    "near_plane": cfg.near_plane,
+                    "far_plane": cfg.far_plane,
+                }
+                self.cfg.strategy.step_post_backward(
+                    params=self.splats,
+                    optimizers=self.optimizers,
+                    state=self.strategy_state,
+                    step=step,
+                    info=info,
+                    packed=cfg.packed,
+                    cameras=camera_dict,
+                    trainset=self.trainset,
                 )
             elif isinstance(self.cfg.strategy, MCMCStrategy):
                 self.cfg.strategy.step_post_backward(
@@ -1436,6 +1505,14 @@ if __name__ == "__main__":
                 opacity_reg=0.01,
                 scale_reg=0.01,
                 strategy=MCMCStrategy(verbose=True),
+            ),
+        ),
+        "fastgs": (
+            "Gaussian splatting training using FastGS methodology from the paper 'FastGS: Training 3D Gaussian Splatting in 100 Seconds'.",
+            Config(
+                strategy=FastGSStrategy(verbose=True),
+                optimizer_schedule=True,
+                use_compact_box=False,  # Can be enabled with --use_compact_box True
             ),
         ),
     }

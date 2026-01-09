@@ -17,7 +17,7 @@ namespace gsplat {
 // 3DGS
 ////////////////////////////////////////////////////
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor> rasterize_to_pixels_3dgs_fwd(
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> rasterize_to_pixels_3dgs_fwd(
     // Gaussian parameters
     const at::Tensor means2d,   // [C, N, 2] or [nnz, 2]
     const at::Tensor conics,    // [C, N, 3] or [nnz, 3]
@@ -31,7 +31,10 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> rasterize_to_pixels_3dgs_fwd(
     const uint32_t tile_size,
     // intersections
     const at::Tensor tile_offsets, // [C, tile_height, tile_width]
-    const at::Tensor flatten_ids   // [n_isects]
+    const at::Tensor flatten_ids,  // [n_isects]
+    // FastGS: metric accumulation
+    const at::optional<at::Tensor> metric_map,    // [C, image_height, image_width]
+    const at::optional<at::Tensor> metric_counts  // [N]
 ) {
     DEVICE_GUARD(means2d);
     CHECK_INPUT(means2d);
@@ -45,6 +48,13 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> rasterize_to_pixels_3dgs_fwd(
     }
     if (masks.has_value()) {
         CHECK_INPUT(masks.value());
+    }
+    // FastGS: validate metric accumulation parameters
+    if (metric_map.has_value()) {
+        CHECK_INPUT(metric_map.value());
+    }
+    if (metric_counts.has_value()) {
+        CHECK_INPUT(metric_counts.value());
     }
 
     uint32_t C = tile_offsets.size(0); // number of cameras
@@ -72,6 +82,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> rasterize_to_pixels_3dgs_fwd(
             tile_size,                                                         \
             tile_offsets,                                                      \
             flatten_ids,                                                       \
+            metric_map,                                                        \
+            metric_counts,                                                     \
             renders,                                                           \
             alphas,                                                            \
             last_ids                                                           \
@@ -106,7 +118,14 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> rasterize_to_pixels_3dgs_fwd(
     }
 #undef __LAUNCH_KERNEL__
 
-    return std::make_tuple(renders, alphas, last_ids);
+    // FastGS: return metric_counts if provided, otherwise return empty tensor
+    at::Tensor return_metric_counts;
+    if (metric_counts.has_value()) {
+        return_metric_counts = metric_counts.value();
+    } else {
+        return_metric_counts = at::empty({0}, means2d.options().dtype(at::kInt));
+    }
+    return std::make_tuple(renders, alphas, last_ids, return_metric_counts);
 }
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>

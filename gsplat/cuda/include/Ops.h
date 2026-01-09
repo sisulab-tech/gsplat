@@ -217,7 +217,7 @@ std::tuple<at::Tensor, at::Tensor> quat_scale_to_covar_preci_bwd(
 );
 
 // Rasterize 3D Gaussian to pixels
-std::tuple<at::Tensor, at::Tensor, at::Tensor> rasterize_to_pixels_3dgs_fwd(
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> rasterize_to_pixels_3dgs_fwd(
     // Gaussian parameters
     const at::Tensor means2d,   // [C, N, 2] or [nnz, 2]
     const at::Tensor conics,    // [C, N, 3] or [nnz, 3]
@@ -231,7 +231,10 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> rasterize_to_pixels_3dgs_fwd(
     const uint32_t tile_size,
     // intersections
     const at::Tensor tile_offsets, // [C, tile_height, tile_width]
-    const at::Tensor flatten_ids   // [n_isects]
+    const at::Tensor flatten_ids,  // [n_isects]
+    // FastGS: metric accumulation
+    const at::optional<at::Tensor> metric_map,    // [C, image_height, image_width]
+    const at::optional<at::Tensor> metric_counts  // [N]
 );
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 rasterize_to_pixels_3dgs_bwd(
@@ -584,6 +587,23 @@ std::tuple<at::Tensor, at::Tensor> points_isect_tiles_tensor(
     const uint32_t tile_size,
     const uint32_t tile_width,
     const uint32_t tile_height,
+    const bool sort,
+    const bool double_buffer
+);
+
+// Compact Box: Precise ellipse-tile intersection using Mahalanobis distance
+std::tuple<at::Tensor, at::Tensor> points_isect_tiles_cb_tensor(
+    const at::Tensor means2d,                    // [C, N, 2] or [nnz, 2]
+    const at::Tensor conics,                     // [C, N, 3] or [nnz, 3]
+    const at::Tensor opacities,                  // [C, N] or [nnz]
+    const at::Tensor depths,                     // [C, N] or [nnz]
+    const at::optional<at::Tensor> camera_ids,   // [nnz]
+    const at::optional<at::Tensor> gaussian_ids, // [nnz]
+    const uint32_t C,
+    const uint32_t tile_size,
+    const uint32_t tile_width,
+    const uint32_t tile_height,
+    const float compact_box_mult,
     const bool sort,
     const bool double_buffer
 );
