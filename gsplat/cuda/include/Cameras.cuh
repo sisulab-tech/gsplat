@@ -888,7 +888,7 @@ struct OpenCVFisheyeCameraModel
             );
         } else {
             std::array<float, 4> ddforward_poly_odd = {
-                6 * k1, 20 * k2, 56 * k3, 72 * k4
+                6 * k1, 20 * k2, 42 * k3, 72 * k4
             };
             std::array<float, 1> approx = {1.57f};
 

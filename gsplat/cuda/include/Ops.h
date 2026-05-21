@@ -555,4 +555,71 @@ rasterize_to_pixels_from_world_3dgs_bwd(
     const at::Tensor v_render_alphas  // [C, image_height, image_width, 1]
 );
 
+at::Tensor compute_3D_smoothing_filter_fwd_tensor(
+    const at::Tensor means,    // [N, 3]
+    const at::Tensor viewmats, // [C, 4, 4]
+    const at::Tensor Ks,       // [C, 3, 3]
+    const uint32_t image_width,
+    const uint32_t image_height,
+    const float near_plane
+);
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor> project_points_fwd_tensor(
+    const at::Tensor means,    // [N, 3]
+    const at::Tensor viewmats, // [C, 4, 4]
+    const at::Tensor Ks,       // [C, 3, 3]
+    const uint32_t image_width,
+    const uint32_t image_height,
+    const float near_plane,
+    const float far_plane
+);
+
+std::tuple<at::Tensor, at::Tensor> points_isect_tiles_tensor(
+    const at::Tensor means2d,                    // [C, N, 2] or [nnz, 2]
+    const at::Tensor radii,                      // [C, N] or [nnz]
+    const at::Tensor depths,                     // [C, N] or [nnz]
+    const at::optional<at::Tensor> camera_ids,   // [nnz]
+    const at::optional<at::Tensor> gaussian_ids, // [nnz]
+    const uint32_t C,
+    const uint32_t tile_size,
+    const uint32_t tile_width,
+    const uint32_t tile_height,
+    const bool sort,
+    const bool double_buffer
+);
+
+std::tuple<at::Tensor, at::Tensor> integrate_to_points_fwd_tensor(
+    // Point parameters
+    const at::Tensor points2d,     // [C, N, 2]
+    const at::Tensor point_depths, // [C, N, 3]
+    // Gaussian parameters
+    const at::Tensor means2d,                   // [C, N, 2]
+    const at::Tensor conics,                    // [C, N, 3]
+    const at::Tensor colors,                    // [C, N, D]
+    const at::Tensor opacities,                 // [N]
+    const at::Tensor view2gaussians,            // [C, N, 10]
+    const at::Tensor Ks,                        // [C, 3, 3]
+    const at::optional<at::Tensor> backgrounds, // [C, D]
+    // image size
+    const uint32_t image_width,
+    const uint32_t image_height,
+    const uint32_t tile_size,
+    // intersections
+    const at::Tensor tile_offsets, // [C, tile_height, tile_width]
+    const at::Tensor flatten_ids,  // [n_isects]
+    // points intersections
+    const at::Tensor point_tile_offsets, // [C, tile_height, tile_width]
+    const at::Tensor point_flatten_ids   // [n_isects]
+);
+
+at::Tensor view_to_gaussians_fwd_tensor(
+    const at::Tensor means,    // [N, 3]
+    const at::Tensor quats,    // [N, 4]
+    const at::Tensor scales,   // [N, 3]
+    const at::Tensor viewmats, // [C, 4, 4]
+    const at::Tensor radii     // [C, N]
+);
+
+at::Tensor py_triangulate(const at::Tensor &points);
+
 } // namespace gsplat
