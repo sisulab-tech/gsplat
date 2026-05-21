@@ -275,6 +275,17 @@ def relocate(
         ratios=torch.bincount(sampled_idxs)[sampled_idxs] + 1,
         binoms=binoms,
     )
+    assert torch.isfinite(new_scales).all(), (
+        f"relocate: compute_relocation produced non-finite new_scales "
+        f"(min={new_scales.min().item()}, max={new_scales.max().item()}, "
+        f"nan={torch.isnan(new_scales).sum().item()}, "
+        f"posinf={torch.isposinf(new_scales).sum().item()}, "
+        f"neginf={torch.isneginf(new_scales).sum().item()}, n={n})"
+    )
+    assert torch.isfinite(new_opacities).all(), (
+        f"relocate: compute_relocation produced non-finite new_opacities "
+        f"(min={new_opacities.min().item()}, max={new_opacities.max().item()})"
+    )
     new_opacities = torch.clamp(new_opacities, max=1.0 - eps, min=min_opacity)
 
     def param_fn(name: str, p: Tensor) -> Tensor:
@@ -316,6 +327,17 @@ def sample_add(
         scales=torch.exp(params["scales"])[sampled_idxs],
         ratios=torch.bincount(sampled_idxs)[sampled_idxs] + 1,
         binoms=binoms,
+    )
+    assert torch.isfinite(new_scales).all(), (
+        f"sample_add: compute_relocation produced non-finite new_scales "
+        f"(min={new_scales.min().item()}, max={new_scales.max().item()}, "
+        f"nan={torch.isnan(new_scales).sum().item()}, "
+        f"posinf={torch.isposinf(new_scales).sum().item()}, "
+        f"neginf={torch.isneginf(new_scales).sum().item()}, n={n})"
+    )
+    assert torch.isfinite(new_opacities).all(), (
+        f"sample_add: compute_relocation produced non-finite new_opacities "
+        f"(min={new_opacities.min().item()}, max={new_opacities.max().item()})"
     )
     new_opacities = torch.clamp(new_opacities, max=1.0 - eps, min=min_opacity)
 
