@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright 2024-2026 the Regents of the University of California, Nerfstudio Team and contributors. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import json
 import os
 from dataclasses import dataclass
@@ -325,6 +340,7 @@ def _compress_kmeans(
     params: Tensor,
     n_clusters: int = 65536,
     quantization: int = 6,
+    eps: float = 1e-6,
     verbose: bool = True,
     **kwargs,
 ) -> Dict[str, Any]:
@@ -339,6 +355,7 @@ def _compress_kmeans(
         params (Tensor): parameters to compress
         n_clusters (int): number of K-means clusters
         quantization (int): number of bits in quantization
+        eps (float, optional): small value to avoid numerical issues. Default to 1e-6.
         verbose (bool, optional): Whether to print verbose information. Default to True.
 
     Returns:
@@ -364,7 +381,7 @@ def _compress_kmeans(
     labels = labels.detach().cpu().numpy()
     centroids = kmeans.centroids.permute(1, 0)
 
-    mins = torch.min(centroids)
+    mins = torch.min(centroids) + eps
     maxs = torch.max(centroids)
     centroids_norm = (centroids - mins) / (maxs - mins)
     centroids_norm = centroids_norm.detach().cpu().numpy()

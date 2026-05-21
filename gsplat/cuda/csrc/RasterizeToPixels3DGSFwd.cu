@@ -1,3 +1,25 @@
+/*
+ * SPDX-FileCopyrightText: Copyright 2025 the Regents of the University of California, Nerfstudio Team and contributors. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "Config.h"
+
+#if GSPLAT_BUILD_3DGS
+
 #include <ATen/Dispatch.h>
 #include <ATen/core/Tensor.h>
 #include <c10/cuda/CUDAStream.h>
@@ -5,6 +27,7 @@
 
 #include "Common.h"
 #include "Rasterization.h"
+#include "MacroUtils.h"
 
 namespace gsplat {
 
@@ -16,47 +39,47 @@ namespace cg = cooperative_groups;
 
 template <uint32_t CDIM, typename scalar_t>
 __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
-    const uint32_t C,
+    const uint32_t I,
     const uint32_t N,
     const uint32_t n_isects,
     const bool packed,
-    const vec2 *__restrict__ means2d,         // [C, N, 2] or [nnz, 2]
-    const vec3 *__restrict__ conics,          // [C, N, 3] or [nnz, 3]
-    const scalar_t *__restrict__ colors,      // [C, N, CDIM] or [nnz, CDIM]
-    const scalar_t *__restrict__ opacities,   // [C, N] or [nnz]
-    const scalar_t *__restrict__ backgrounds, // [C, CDIM]
-    const bool *__restrict__ masks,           // [C, tile_height, tile_width]
+    const vec2 *__restrict__ means2d,         // [I, N, 2] or [nnz, 2]
+    const vec3 *__restrict__ conics,          // [I, N, 3] or [nnz, 3]
+    const scalar_t *__restrict__ colors,      // [I, N, CDIM] or [nnz, CDIM]
+    const scalar_t *__restrict__ opacities,   // [I, N] or [nnz]
+    const scalar_t *__restrict__ backgrounds, // [I, CDIM]
+    const bool *__restrict__ masks,           // [I, tile_height, tile_width]
     const uint32_t image_width,
     const uint32_t image_height,
     const uint32_t tile_size,
     const uint32_t tile_width,
     const uint32_t tile_height,
-    const int32_t *__restrict__ tile_offsets, // [C, tile_height, tile_width]
+    const int32_t *__restrict__ tile_offsets, // [I, tile_height, tile_width]
     const int32_t *__restrict__ flatten_ids,  // [n_isects]
     scalar_t
-        *__restrict__ render_colors, // [C, image_height, image_width, CDIM]
-    scalar_t *__restrict__ render_alphas, // [C, image_height, image_width, 1]
-    int32_t *__restrict__ last_ids        // [C, image_height, image_width]
+        *__restrict__ render_colors, // [I, image_height, image_width, CDIM]
+    scalar_t *__restrict__ render_alphas, // [I, image_height, image_width, 1]
+    int32_t *__restrict__ last_ids        // [I, image_height, image_width]
 ) {
     // each thread draws one pixel, but also timeshares caching gaussians in a
     // shared tile
 
     auto block = cg::this_thread_block();
-    int32_t camera_id = block.group_index().x;
+    int32_t image_id = block.group_index().x;
     int32_t tile_id =
         block.group_index().y * tile_width + block.group_index().z;
     uint32_t i = block.group_index().y * tile_size + block.thread_index().y;
     uint32_t j = block.group_index().z * tile_size + block.thread_index().x;
 
-    tile_offsets += camera_id * tile_height * tile_width;
-    render_colors += camera_id * image_height * image_width * CDIM;
-    render_alphas += camera_id * image_height * image_width;
-    last_ids += camera_id * image_height * image_width;
+    tile_offsets += image_id * tile_height * tile_width;
+    render_colors += image_id * image_height * image_width * CDIM;
+    render_alphas += image_id * image_height * image_width;
+    last_ids += image_id * image_height * image_width;
     if (backgrounds != nullptr) {
-        backgrounds += camera_id * CDIM;
+        backgrounds += image_id * CDIM;
     }
     if (masks != nullptr) {
-        masks += camera_id * tile_height * tile_width;
+        masks += image_id * tile_height * tile_width;
     }
 
     float px = (float)j + 0.5f;
@@ -70,11 +93,13 @@ __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
 
     // when the mask is provided, render the background color and return
     // if this tile is labeled as False
-    if (masks != nullptr && inside && !masks[tile_id]) {
+    if (masks != nullptr && !masks[tile_id]) {
+        if (inside) {
 #pragma unroll
-        for (uint32_t k = 0; k < CDIM; ++k) {
-            render_colors[pix_id * CDIM + k] =
-                backgrounds == nullptr ? 0.0f : backgrounds[k];
+            for (uint32_t k = 0; k < CDIM; ++k) {
+                render_colors[pix_id * CDIM + k] =
+                    backgrounds == nullptr ? 0.0f : backgrounds[k];
+            }
         }
         return;
     }
@@ -84,7 +109,7 @@ __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
     // which gaussians to look through in this tile
     int32_t range_start = tile_offsets[tile_id];
     int32_t range_end =
-        (camera_id == C - 1) && (tile_id == tile_width * tile_height - 1)
+        (image_id == I - 1) && (tile_id == tile_width * tile_height - 1)
             ? n_isects
             : tile_offsets[tile_id + 1];
     const uint32_t block_size = block.size();
@@ -124,7 +149,7 @@ __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
         uint32_t batch_start = range_start + block_size * b;
         uint32_t idx = batch_start + tr;
         if (idx < range_end) {
-            int32_t g = flatten_ids[idx]; // flatten index in [C * N] or [nnz]
+            int32_t g = flatten_ids[idx]; // flatten index in [I * N] or [nnz]
             id_batch[tr] = g;
             const vec2 xy = means2d[g];
             const float opac = opacities[g];
@@ -145,13 +170,13 @@ __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
             const float sigma = 0.5f * (conic.x * delta.x * delta.x +
                                         conic.z * delta.y * delta.y) +
                                 conic.y * delta.x * delta.y;
-            float alpha = min(0.999f, opac * __expf(-sigma));
+            float alpha = min(MAX_ALPHA, opac * __expf(-sigma));
             if (sigma < 0.f || alpha < ALPHA_THRESHOLD) {
                 continue;
             }
 
             const float next_T = T * (1.0f - alpha);
-            if (next_T <= 1e-4f) { // this pixel is done: exclusive
+            if (next_T <= TRANSMITTANCE_THRESHOLD) { // this pixel is done: exclusive
                 done = true;
                 break;
             }
@@ -190,36 +215,36 @@ __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
 template <uint32_t CDIM>
 void launch_rasterize_to_pixels_3dgs_fwd_kernel(
     // Gaussian parameters
-    const at::Tensor means2d,   // [C, N, 2] or [nnz, 2]
-    const at::Tensor conics,    // [C, N, 3] or [nnz, 3]
-    const at::Tensor colors,    // [C, N, channels] or [nnz, channels]
-    const at::Tensor opacities, // [C, N]  or [nnz]
-    const at::optional<at::Tensor> backgrounds, // [C, channels]
-    const at::optional<at::Tensor> masks,       // [C, tile_height, tile_width]
+    const at::Tensor means2d,   // [..., N, 2] or [nnz, 2]
+    const at::Tensor conics,    // [..., N, 3] or [nnz, 3]
+    const at::Tensor colors,    // [..., N, channels] or [nnz, channels]
+    const at::Tensor opacities, // [..., N]  or [nnz]
+    const at::optional<at::Tensor> backgrounds, // [..., channels]
+    const at::optional<at::Tensor> masks,       // [..., tile_height, tile_width]
     // image size
     const uint32_t image_width,
     const uint32_t image_height,
     const uint32_t tile_size,
     // intersections
-    const at::Tensor tile_offsets, // [C, tile_height, tile_width]
+    const at::Tensor tile_offsets, // [..., tile_height, tile_width]
     const at::Tensor flatten_ids,  // [n_isects]
     // outputs
-    at::Tensor renders, // [C, image_height, image_width, channels]
-    at::Tensor alphas,  // [C, image_height, image_width]
-    at::Tensor last_ids // [C, image_height, image_width]
+    at::Tensor renders, // [..., image_height, image_width, channels]
+    at::Tensor alphas,  // [..., image_height, image_width]
+    at::Tensor last_ids // [..., image_height, image_width]
 ) {
     bool packed = means2d.dim() == 2;
 
-    uint32_t C = tile_offsets.size(0);         // number of cameras
-    uint32_t N = packed ? 0 : means2d.size(1); // number of gaussians
-    uint32_t tile_height = tile_offsets.size(1);
-    uint32_t tile_width = tile_offsets.size(2);
+    uint32_t N = packed ? 0 : means2d.size(-2); // number of gaussians
+    uint32_t I = alphas.numel() / (image_height * image_width); // number of images
+    uint32_t tile_height = tile_offsets.size(-2);
+    uint32_t tile_width = tile_offsets.size(-1);
     uint32_t n_isects = flatten_ids.size(0);
 
     // Each block covers a tile on the image. In total there are
-    // C * tile_height * tile_width blocks.
+    // I * tile_height * tile_width blocks.
     dim3 threads = {tile_size, tile_size, 1};
-    dim3 grid = {C, tile_height, tile_width};
+    dim3 grid = {I, tile_height, tile_width};
 
     int64_t shmem_size =
         tile_size * tile_size * (sizeof(int32_t) + sizeof(vec3) + sizeof(vec3));
@@ -241,7 +266,7 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
 
     rasterize_to_pixels_3dgs_fwd_kernel<CDIM, float>
         <<<grid, threads, shmem_size, at::cuda::getCurrentCUDAStream()>>>(
-            C,
+            I,
             N,
             n_isects,
             packed,
@@ -286,25 +311,9 @@ void launch_rasterize_to_pixels_3dgs_fwd_kernel(
         at::Tensor last_ids                                                    \
     );
 
-__INS__(1)
-__INS__(2)
-__INS__(3)
-__INS__(4)
-__INS__(5)
-__INS__(8)
-__INS__(9)
-__INS__(16)
-__INS__(17)
-__INS__(32)
-__INS__(33)
-__INS__(64)
-__INS__(65)
-__INS__(128)
-__INS__(129)
-__INS__(256)
-__INS__(257)
-__INS__(512)
-__INS__(513)
+GSPLAT_FOR_EACH(__INS__, GSPLAT_NUM_CHANNELS)
 #undef __INS__
 
 } // namespace gsplat
+
+#endif

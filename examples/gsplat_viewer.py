@@ -1,8 +1,27 @@
+# SPDX-FileCopyrightText: Copyright 2025 the Regents of the University of California, Nerfstudio Team and contributors. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import viser
 from pathlib import Path
 from typing import Literal
 from typing import Tuple, Callable
 from nerfview import Viewer, RenderTabState
+
+from gsplat.rendering import RasterizeMode
+from gsplat.cuda._wrapper import CameraModel
 
 
 class GsplatRenderTabState(RenderTabState):
@@ -21,12 +40,12 @@ class GsplatRenderTabState(RenderTabState):
         "rgb", "depth(accumulated)", "depth(expected)", "alpha"
     ] = "rgb"
     normalize_nearfar: bool = False
-    inverse: bool = True
+    inverse: bool = False
     colormap: Literal[
         "turbo", "viridis", "magma", "inferno", "cividis", "gray"
     ] = "turbo"
-    rasterize_mode: Literal["classic", "antialiased"] = "classic"
-    camera_model: Literal["pinhole", "ortho", "fisheye"] = "pinhole"
+    rasterize_mode: RasterizeMode = "classic"
+    camera_model: CameraModel = "pinhole"
 
 
 class GsplatViewer(Viewer):
@@ -150,12 +169,10 @@ class GsplatViewer(Viewer):
                 def _(_) -> None:
                     if "depth" in render_mode_dropdown.value:
                         normalize_nearfar_checkbox.disabled = False
+                        inverse_checkbox.disabled = False
                     else:
                         normalize_nearfar_checkbox.disabled = True
-                    if render_mode_dropdown.value == "rgb":
                         inverse_checkbox.disabled = True
-                    else:
-                        inverse_checkbox.disabled = False
                     self.render_tab_state.render_mode = render_mode_dropdown.value
                     self.rerender(_)
 

@@ -1,3 +1,21 @@
+/*
+ * SPDX-FileCopyrightText: Copyright 2025 the Regents of the University of California, Nerfstudio Team and contributors. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 // Some of the code are referenced from 3DGRUT codebase.
 // https://github.com/nv-tlabs/3dgrut
 #pragma once
@@ -5,6 +23,7 @@
 #include <array>
 #include <cmath>
 #include <limits>
+#include <cuda_runtime.h>
 
 // Silence warnings / errors of the form
 //
@@ -19,6 +38,7 @@
 #pragma nv_diag_default = esa_on_defaulted_function_ignored
 
 #include "Cameras.h"
+#include "ExternalDistortion.cuh"
 
 template <typename T, std::size_t N>
 __device__ std::array<T, N> make_array(const T *ptr) {
@@ -35,6 +55,9 @@ struct RollingShutterParameters {
     glm::fquat q_start;
     glm::fvec3 t_end;
     glm::fquat q_end;
+
+    __device__
+    RollingShutterParameters() = default;
 
     __device__
     RollingShutterParameters(const float *se3_start, const float *se3_end) {
@@ -273,6 +296,19 @@ struct ShutterPose {
     }
 };
 
+// When precise quaternion normalization is needed, CUDA <= 12.8 does not keep
+// enough precision under -use_fast_math and needs the explicit operation below.
+inline __device__ auto precise_normalize(glm::fquat const &q) -> glm::fquat {
+#if defined(__CUDACC_VER_MAJOR__) && \
+    ((__CUDACC_VER_MAJOR__ < 12) || \
+     (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ <= 8))
+    auto const inv_norm = __frsqrt_rn(glm::dot(q, q));
+    return q * inv_norm;
+#else
+    return glm::normalize(q);
+#endif
+}
+
 inline __device__ auto interpolate_shutter_pose(
     float relative_frame_time,
     RollingShutterParameters const &rolling_shutter_parameters
@@ -284,7 +320,7 @@ inline __device__ auto interpolate_shutter_pose(
     // Interpolate a pose linearly for a relative frame time
     auto const t_rs =
         (1.f - relative_frame_time) * t_start + relative_frame_time * t_end;
-    auto const q_rs = glm::slerp(q_start, q_end, relative_frame_time);
+    auto const q_rs = glm::normalize(glm::slerp(q_start, q_end, relative_frame_time));
     return ShutterPose{t_rs, q_rs};
 }
 
@@ -294,7 +330,77 @@ template <class DerivedCameraModel> struct BaseCameraModel {
     struct Parameters {
         std::array<uint32_t, 2> resolution;
         ShutterType shutter_type;
+        const gsplat::extdist::BivariateWindshieldModelDeviceParams* external_distortion_params = nullptr;
     };
+
+    __host__ __device__ BaseCameraModel(
+        const gsplat::extdist::BivariateWindshieldModelDeviceParams* ext_dist_params = nullptr)
+        : external_distortion_params(ext_dist_params) {}
+
+    const gsplat::extdist::BivariateWindshieldModelDeviceParams* external_distortion_params;
+
+    struct ImagePointReturn {
+        glm::fvec2 imagePoint;
+        bool valid_flag;
+    };
+
+    // Apply external distortion before camera projection (forward)
+    inline __device__ auto camera_ray_to_image_point(
+        const glm::fvec3& cam_ray, 
+        float margin_factor
+    ) const -> ImagePointReturn {
+        auto derived = static_cast<DerivedCameraModel const*>(this);
+        auto distorted_ray = cam_ray;
+
+        if (external_distortion_params != nullptr) {
+            distorted_ray = gsplat::extdist::BivariateWindshieldModel::distort_camera_ray(
+                cam_ray,
+                external_distortion_params->horizontal_poly_ptr,
+                external_distortion_params->vertical_poly_ptr,
+                external_distortion_params->horizontal_poly_order,
+                external_distortion_params->vertical_poly_order
+            );
+        }
+        
+        return derived->camera_ray_to_image_point_impl(distorted_ray, margin_factor);
+    }
+
+    // Undo external distortion after camera unprojection (inverse)
+    inline __device__ CameraRay image_point_to_camera_ray(glm::fvec2 image_point) const {
+        auto derived = static_cast<DerivedCameraModel const*>(this);
+        auto cam_ray = derived->image_point_to_camera_ray_impl(image_point);
+        
+        if (cam_ray.valid_flag && external_distortion_params != nullptr) {
+            cam_ray.ray_dir = gsplat::extdist::BivariateWindshieldModel::distort_camera_ray(
+                cam_ray.ray_dir,
+                external_distortion_params->horizontal_poly_inverse_ptr,
+                external_distortion_params->vertical_poly_inverse_ptr,
+                external_distortion_params->horizontal_poly_inverse_order,
+                external_distortion_params->vertical_poly_inverse_order
+            );
+        }
+        
+        return cam_ray;
+    }
+
+    // Convert pixel indices (column j, row i) to image-point coordinates.
+    // For pixel-based cameras, returns pixel centers (j+0.5, i+0.5).
+    // Lidar overrides this to return scaled-angle coordinates.
+    inline __device__ glm::fvec2 element_to_image_point(int j, int i) const
+    {
+        return {(float)j + 0.5f, (float)i + 0.5f};
+    }
+
+    // Generate a world ray for pixel (j, i) using rolling shutter parameters.
+    // Chains element_to_image_point → image_point_to_world_ray_shutter_pose.
+    inline __device__ WorldRay element_to_world_ray_shutter_pose(
+        int j, int i,
+        const RollingShutterParameters &rs_params) const
+    {
+        auto derived = static_cast<DerivedCameraModel const *>(this);
+        const auto img_pt = derived->element_to_image_point(j, i);
+        return derived->image_point_to_world_ray_shutter_pose(img_pt, rs_params);
+    }
 
     // Function to compute the relative frame time for a given image point based
     // on the shutter type
@@ -342,16 +448,11 @@ template <class DerivedCameraModel> struct BaseCameraModel {
         }
 
         return interpolate_shutter_pose(
-                   shutter_relative_frame_time(image_point),
+                   derived->shutter_relative_frame_time(image_point),
                    rolling_shutter_parameters
         )
             .camera_ray_to_world_ray(camera_ray.ray_dir);
-    };
-
-    struct ImagePointReturn {
-        glm::fvec2 imagePoint;
-        bool valid_flag;
-    };
+    }
 
     template <size_t N_ROLLING_SHUTTER_ITERATIONS = 10>
     inline __device__ auto world_point_to_image_point_shutter_pose(
@@ -406,14 +507,19 @@ template <class DerivedCameraModel> struct BaseCameraModel {
         auto relative_frame_time = float{};
         auto t_rs = glm::fvec3{};
         auto q_rs = glm::fquat{};
+        bool valid = true;
 #pragma unroll
         for (auto j = 0; j < N_ROLLING_SHUTTER_ITERATIONS; ++j) {
             relative_frame_time =
-                shutter_relative_frame_time(image_points_rs_prev);
+                derived->shutter_relative_frame_time(image_points_rs_prev);
 
             t_rs = (1.f - relative_frame_time) * t_start +
                    relative_frame_time * t_end;
-            q_rs = glm::slerp(q_start, q_end, relative_frame_time);
+            // The rolling-shutter optimization loop is sensitive to small pose
+            // updates, so use the precise normalization here.
+            q_rs = precise_normalize(
+                glm::slerp(q_start, q_end, relative_frame_time)
+            );
 
             auto const [image_point_rs, valid_rs] =
                 derived->camera_ray_to_image_point(
@@ -421,9 +527,10 @@ template <class DerivedCameraModel> struct BaseCameraModel {
                 );
 
             image_points_rs_prev = image_point_rs;
+            valid = valid_rs;
         }
 
-        return {{image_points_rs_prev.x, image_points_rs_prev.y}, true};
+        return {{image_points_rs_prev.x, image_points_rs_prev.y}, valid};
     }
 };
 
@@ -438,11 +545,12 @@ struct PerfectPinholeCameraModel : BaseCameraModel<PerfectPinholeCameraModel> {
     };
 
     __device__ PerfectPinholeCameraModel(Parameters const &parameters)
-        : parameters(parameters) {}
+        : Base(parameters.external_distortion_params),
+          parameters(parameters) {}
 
     Parameters parameters;
 
-    inline __device__ auto camera_ray_to_image_point(
+    inline __device__ auto camera_ray_to_image_point_impl(
         glm::fvec3 const &cam_ray, float margin_factor
     ) const -> typename Base::ImagePointReturn {
         auto image_point = glm::fvec2{0.f, 0.f};
@@ -472,7 +580,7 @@ struct PerfectPinholeCameraModel : BaseCameraModel<PerfectPinholeCameraModel> {
         return {image_point, valid};
     }
 
-    inline __device__ CameraRay image_point_to_camera_ray(glm::fvec2 image_point
+    inline __device__ CameraRay image_point_to_camera_ray_impl(glm::fvec2 image_point
     ) const {
         // Transform the image point to uv coordinate
         auto const uv =
@@ -510,7 +618,8 @@ struct OpenCVPinholeCameraModel
         Parameters const &parameters,
         float stop_undistortion_square_error_px2 = 1e-12
     )
-        : parameters(parameters),
+        : Base(parameters.external_distortion_params),
+          parameters(parameters),
           undistortion_stop_square_error_px2(stop_undistortion_square_error_px2
           ) {}
 
@@ -541,7 +650,13 @@ struct OpenCVPinholeCameraModel
             1.f + r2 * (parameters.radial_coeffs[3] +
                         r2 * (parameters.radial_coeffs[4] +
                               r2 * parameters.radial_coeffs[5]));
-        auto const icD = icD_numerator / icD_denominator;
+        // Guard against the rational distortion model having a pole (denominator
+        // = 0) at this r².  Setting icD = 0 makes the downstream validity check
+        // (icD > 0.8) reject this point, which is the correct behavior — the
+        // camera model cannot reliably project at this radius.
+        auto const icD = (std::fabs(icD_denominator) > 1e-8f)
+            ? icD_numerator / icD_denominator
+            : 0.f;
 
         auto const delta_x = parameters.tangential_coeffs[0] * a1 +
                              parameters.tangential_coeffs[1] * a2 +
@@ -555,7 +670,7 @@ struct OpenCVPinholeCameraModel
         return {icD, glm::fvec2{delta_x, delta_y}, r2};
     }
 
-    inline __device__ auto camera_ray_to_image_point(
+    inline __device__ auto camera_ray_to_image_point_impl(
         glm::fvec3 const &cam_ray, float margin_factor
     ) const -> typename Base::ImagePointReturn {
         auto image_point = glm::fvec2{0.f, 0.f};
@@ -770,7 +885,7 @@ struct OpenCVPinholeCameraModel
         return {x, y};
     }
 
-    inline __device__ CameraRay image_point_to_camera_ray(glm::fvec2 image_point
+    inline __device__ CameraRay image_point_to_camera_ray_impl(glm::fvec2 image_point
     ) const {
         // Undistort the image point to uv coordinate. Newton method is more
         // accurate than iterative method, but slower.
@@ -862,7 +977,7 @@ struct OpenCVFisheyeCameraModel
     __host__ __device__ OpenCVFisheyeCameraModel(
         Parameters const &parameters, float min_2d_norm = 1e-6f
     )
-        : parameters(parameters), min_2d_norm(min_2d_norm) {
+        : Base(parameters.external_distortion_params), parameters(parameters), min_2d_norm(min_2d_norm) {
         // initialize ninth-degree odd-only forward polynomial (mapping angles
         // to normalized distances) theta + k1*theta^3 + k2*theta^5 + k3*theta^7
         // + k4*theta^9
@@ -870,7 +985,7 @@ struct OpenCVFisheyeCameraModel
         forward_poly_odd = {1.f, k1, k2, k3, k4};
 
         // eighth-degree differential of forward polynomial 1 + 3*k1*theta^2 +
-        // 5*k2*theta^4 + 7*k3*theta^8 + 9*k4*theta^8
+        // 5*k2*theta^4 + 7*k3*theta^6 + 9*k4*theta^8
         dforward_poly_even = {1, 3 * k1, 5 * k2, 7 * k3, 9 * k4};
 
         auto const max_diag_x =
@@ -927,7 +1042,7 @@ struct OpenCVFisheyeCameraModel
     std::array<float, 2> approx_backward_poly;
     float max_angle;
 
-    inline __device__ auto camera_ray_to_image_point(
+    inline __device__ auto camera_ray_to_image_point_impl(
         glm::fvec3 const &cam_ray, float margin_factor
     ) const -> typename Base::ImagePointReturn {
         if (cam_ray.z <= 0.f)
@@ -997,7 +1112,7 @@ struct OpenCVFisheyeCameraModel
         return {image_point, valid};
     }
 
-    inline __device__ CameraRay image_point_to_camera_ray(glm::fvec2 image_point
+    inline __device__ CameraRay image_point_to_camera_ray_impl(glm::fvec2 image_point
     ) const {
         // Normalize the image point coordinates
         auto const uv =
@@ -1022,6 +1137,175 @@ struct OpenCVFisheyeCameraModel
 
         // Flipped points is not physically meaningful.
         if (theta < 0.f || theta >= max_angle || !converged) {
+            return {glm::fvec3{0.f, 0.f, 1.f}, false};
+        }
+
+        // Compute the camera ray and set the ones at the image center to
+        // [0,0,1]
+        if (delta >= min_2d_norm) {
+            // Scale the uv coordinates by the sine of the angle theta
+            auto const scale_factor = std::sin(theta) / delta;
+            return {
+                glm::fvec3{
+                    scale_factor * uv.x, scale_factor * uv.y, std::cos(theta)
+                },
+                true
+            };
+        } else {
+            // For points at the image center, return a ray pointing straight
+            // ahead
+            return {glm::fvec3{0.f, 0.f, 1.f}, true};
+        }
+    }
+};
+
+
+
+
+struct FThetaCameraDistortionDeviceParams {
+    inline __device__ FThetaCameraDistortionDeviceParams(){}
+
+    inline __host__ FThetaCameraDistortionDeviceParams(const FThetaCameraDistortionParameters& params)
+    : reference_poly(params.reference_poly)
+    , pixeldist_to_angle_poly(params.pixeldist_to_angle_poly)
+    , angle_to_pixeldist_poly(params.angle_to_pixeldist_poly)
+    , max_angle(params.max_angle)
+    , linear_cde(params.linear_cde) {}
+
+    FThetaCameraDistortionParameters::PolynomialType reference_poly;
+    std::array<float, FThetaCameraDistortionParameters::PolynomialDegree> pixeldist_to_angle_poly; // backward polynomial
+    std::array<float, FThetaCameraDistortionParameters::PolynomialDegree> angle_to_pixeldist_poly; // forward polynomial
+    float max_angle;
+    std::array<float, 3> linear_cde;
+};
+
+template <size_t N_NEWTON_ITERATIONS = 3>
+struct FThetaCameraModel : BaseCameraModel<FThetaCameraModel<N_NEWTON_ITERATIONS>> {
+    // FTheta camera model
+public:
+    using Base = BaseCameraModel<FThetaCameraModel<N_NEWTON_ITERATIONS>>;
+
+    struct Parameters : Base::Parameters {
+        FThetaCameraDistortionDeviceParams dist;
+        std::array<float, 2> principal_point;
+    };
+
+    __host__ __device__ FThetaCameraModel(
+        Parameters const& parameters, float min_2d_norm = 1e-6f
+    )
+        : Base(parameters.external_distortion_params), parameters(parameters), min_2d_norm(min_2d_norm), dreference_poly{} {
+
+        auto const dist = parameters.dist;
+
+        if (dist.reference_poly == FThetaCameraDistortionParameters::PolynomialType::PIXELDIST_TO_ANGLE)
+            // compute first derivative of the backwards polynomial
+            dreference_poly = {1.f * dist.pixeldist_to_angle_poly.at(1), 2.f * dist.pixeldist_to_angle_poly.at(2), 3.f * dist.pixeldist_to_angle_poly.at(3), 4.f * dist.pixeldist_to_angle_poly.at(4), 5.f * dist.pixeldist_to_angle_poly.at(5)};
+        else
+            // compute first derivative of the forward polynomial
+            dreference_poly = {1.f * dist.angle_to_pixeldist_poly.at(1), 2.f * dist.angle_to_pixeldist_poly.at(2), 3.f * dist.angle_to_pixeldist_poly.at(3), 4.f * dist.angle_to_pixeldist_poly.at(4), 5.f * dist.angle_to_pixeldist_poly.at(5)};
+
+        // FThetaCameraModelParameters are defined such that the image coordinate origin corresponds to
+        // the center of the first pixel. We therefore need to offset the principal point by half a pixel.
+        this->parameters.principal_point[0] += .5f;
+        this->parameters.principal_point[1] += .5f;
+    }
+
+    Parameters parameters;
+    float min_2d_norm;
+    std::array<float, 5> dreference_poly; // coefficient of first derivative of the reference polynomial
+
+    inline __device__ auto camera_ray_to_image_point_impl(
+        glm::fvec3 const &cam_ray, float margin_factor
+    ) const -> typename Base::ImagePointReturn {
+        if (cam_ray.z <= 0.f)
+            return {{0.f, 0.f}, false};
+
+        // Make sure norm is non-vanishing (norm vanishes for points along the principal-axis)
+        auto cam_ray_xy_norm = numerically_stable_norm2(cam_ray.x, cam_ray.y);
+        if (cam_ray_xy_norm <= 0.f)
+            cam_ray_xy_norm = std::numeric_limits<float>::epsilon();
+
+        auto const theta_full = atan2f(cam_ray_xy_norm, cam_ray.z);
+
+        // Limit angles to max_angle to prevent projected points to leave valid cone around max_angle.
+        // In particular for omnidirectional cameras, this prevents points outside the FOV to be
+        // wrongly projected to in-image-domain points because of badly constrained polynomials outside
+        // the effective FOV (which is different to the image boundaries).
+
+        // These FOV-clamped projections will be marked as *invalid*
+        auto const theta = theta_full < parameters.dist.max_angle ? theta_full : parameters.dist.max_angle;
+
+        // Evaluate forward polynomial, giving delta = f(theta) factors
+        bool converged;
+        float delta;
+        if (parameters.dist.reference_poly == FThetaCameraDistortionParameters::PolynomialType::PIXELDIST_TO_ANGLE) {
+            // bw poly is reference, evaluate its inverse via Newton-based inversion
+            converged = false;
+            delta = eval_poly_inverse_horner_newton<N_NEWTON_ITERATIONS>( 
+                      PolynomialProxy<PolynomialType::FULL, 6>{parameters.dist.pixeldist_to_angle_poly},
+                      PolynomialProxy<PolynomialType::FULL, 5>{dreference_poly},
+                      PolynomialProxy<PolynomialType::FULL, 6>{parameters.dist.angle_to_pixeldist_poly},
+                      theta, converged);
+        } else {
+            // fw is reference, evaluate it directly
+            converged = true;
+            delta = eval_poly_horner(parameters.dist.angle_to_pixeldist_poly, theta); 
+        }
+
+        if (!converged) {
+            return {{0.f, 0.f}, false};
+        }
+
+        // Apply linear term A=[c,d;e,1] to f(theta)-weighted normalized 2d vectors, relative to principal point
+        auto const& [c, d, e] = parameters.dist.linear_cde;
+        auto image_point      = delta * (glm::fvec2{cam_ray.x, cam_ray.y} / cam_ray_xy_norm);
+        image_point           = glm::fvec2{c * image_point.x + d * image_point.y, e * image_point.x + image_point.y} +
+                      glm::fvec2{parameters.principal_point[0], parameters.principal_point[1]};
+
+        auto valid = true;
+        valid &= image_point_in_image_bounds_margin(
+            image_point, parameters.resolution, margin_factor
+        );
+        valid &= theta <= parameters.dist.max_angle;
+
+        return {image_point, valid};
+    }
+
+    inline __device__ CameraRay image_point_to_camera_ray_impl(glm::fvec2 image_point) const {
+        // Get f(theta)-weighted normalized 2d vectors around principal point,
+        // undoing linear term A = [c,d;e;1] via A^-1 = [1,-d;-e,c] / (c-e*d)
+        auto const& [c, d, e] = parameters.dist.linear_cde;
+        image_point -= glm::fvec2{parameters.principal_point[0], parameters.principal_point[1]};
+        // The CDE linear matrix [[c,d],[e,1]] must be invertible for
+        // unprojection.  A singular matrix (det = c - e*d ≈ 0) means the
+        // calibration is degenerate — return an invalid ray.
+        auto const cde_det = c - e * d;
+        if (std::fabs(cde_det) < 1e-8f) {
+            return {glm::fvec3{0.f, 0.f, 1.f}, false};
+        }
+        auto const uv = glm::fvec2{image_point.x - d * image_point.y, -e * image_point.x + c * image_point.y} / cde_det;
+
+        // Compute the radial distance from the principal point
+        auto const delta = length(uv);
+
+        // Evaluate backward polynomial to get theta = f^-1(delta) factor
+        bool converged;
+        float theta;
+        if (parameters.dist.reference_poly == FThetaCameraDistortionParameters::PolynomialType::PIXELDIST_TO_ANGLE) {
+            // bw is reference, evaluate it directly
+            converged = true;
+            theta = eval_poly_horner(parameters.dist.pixeldist_to_angle_poly, delta);
+        } else {
+            // fw is reference, evaluate its inverse via Newton-based inversion
+            converged = false;
+            theta = eval_poly_inverse_horner_newton<N_NEWTON_ITERATIONS>(
+                      PolynomialProxy<PolynomialType::FULL, 6>{parameters.dist.angle_to_pixeldist_poly},
+                      PolynomialProxy<PolynomialType::FULL, 5>{dreference_poly},
+                      PolynomialProxy<PolynomialType::FULL, 6>{parameters.dist.pixeldist_to_angle_poly},
+                      delta, converged);
+        }
+
+        if (!converged) {
             return {glm::fvec3{0.f, 0.f, 1.f}, false};
         }
 

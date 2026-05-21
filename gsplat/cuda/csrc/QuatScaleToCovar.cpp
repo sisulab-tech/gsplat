@@ -1,3 +1,25 @@
+/*
+ * SPDX-FileCopyrightText: Copyright 2025 the Regents of the University of California, Nerfstudio Team and contributors. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "Config.h"
+
+#if GSPLAT_BUILD_3DGS
+
 #include <ATen/TensorUtils.h>
 #include <ATen/core/Tensor.h>
 #include <c10/cuda/CUDAGuard.h> // for DEVICE_GUARD
@@ -15,33 +37,27 @@
 namespace gsplat {
 
 std::tuple<at::Tensor, at::Tensor> quat_scale_to_covar_preci_fwd(
-    const at::Tensor quats,  // [N, 4]
-    const at::Tensor scales, // [N, 3]
-    const bool compute_covar,
-    const bool compute_preci,
-    const bool triu
+    const at::Tensor &quats,  // [..., 4]
+    const at::Tensor &scales, // [..., 3]
+    bool compute_covar,
+    bool compute_preci,
+    bool triu
 ) {
     DEVICE_GUARD(quats);
     CHECK_INPUT(quats);
     CHECK_INPUT(scales);
 
-    uint32_t N = quats.size(0);
+    auto opt = quats.options();
+    at::DimVector out_shape(quats.sizes().slice(0, quats.dim() - 1));
+    if (triu) {
+        out_shape.append({6});
+    } else {
+        out_shape.append({3, 3});
+    }
 
     at::Tensor covars, precis;
-    if (compute_covar) {
-        if (triu) {
-            covars = at::empty({N, 6}, quats.options());
-        } else {
-            covars = at::empty({N, 3, 3}, quats.options());
-        }
-    }
-    if (compute_preci) {
-        if (triu) {
-            precis = at::empty({N, 6}, quats.options());
-        } else {
-            precis = at::empty({N, 3, 3}, quats.options());
-        }
-    }
+    if (compute_covar) covars = at::empty(out_shape, opt);
+    if (compute_preci) precis = at::empty(out_shape, opt);
 
     launch_quat_scale_to_covar_preci_fwd_kernel(
         quats,
@@ -55,11 +71,11 @@ std::tuple<at::Tensor, at::Tensor> quat_scale_to_covar_preci_fwd(
 }
 
 std::tuple<at::Tensor, at::Tensor> quat_scale_to_covar_preci_bwd(
-    const at::Tensor quats,  // [N, 4]
-    const at::Tensor scales, // [N, 3]
-    const bool triu,
-    const at::optional<at::Tensor> v_covars, // [N, 3, 3] or [N, 6]
-    const at::optional<at::Tensor> v_precis  // [N, 3, 3] or [N, 6]
+    const at::Tensor &quats,  // [..., 4]
+    const at::Tensor &scales, // [..., 3]
+    bool triu,
+    const at::optional<at::Tensor> &v_covars, // [..., 3, 3] or [..., 6]
+    const at::optional<at::Tensor> &v_precis  // [..., 3, 3] or [..., 6]
 ) {
     DEVICE_GUARD(quats);
     CHECK_INPUT(quats);
@@ -70,8 +86,6 @@ std::tuple<at::Tensor, at::Tensor> quat_scale_to_covar_preci_bwd(
     if (v_precis.has_value()) {
         CHECK_INPUT(v_precis.value());
     }
-
-    uint32_t N = quats.size(0);
 
     // kernel with directly write values into these tensors so we could empty
     // init them.
@@ -92,3 +106,5 @@ std::tuple<at::Tensor, at::Tensor> quat_scale_to_covar_preci_bwd(
 }
 
 } // namespace gsplat
+
+#endif

@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright 2024-2025 the Regents of the University of California, Nerfstudio Team and contributors. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import random
 
 import matplotlib.pyplot as plt
@@ -37,13 +52,13 @@ class CameraOptModule(torch.nn.Module):
             updated camtoworlds: (..., 4, 4)
         """
         assert camtoworlds.shape[:-2] == embed_ids.shape
-        batch_shape = camtoworlds.shape[:-2]
+        batch_dims = camtoworlds.shape[:-2]
         pose_deltas = self.embeds(embed_ids)  # (..., 9)
         dx, drot = pose_deltas[..., :3], pose_deltas[..., 3:]
         rot = rotation_6d_to_matrix(
-            drot + self.identity.expand(*batch_shape, -1)
+            drot + self.identity.expand(*batch_dims, -1)
         )  # (..., 3, 3)
-        transform = torch.eye(4, device=pose_deltas.device).repeat((*batch_shape, 1, 1))
+        transform = torch.eye(4, device=pose_deltas.device).repeat((*batch_dims, 1, 1))
         transform[..., :3, :3] = rot
         transform[..., :3, 3] = dx
         return torch.matmul(camtoworlds, transform)
