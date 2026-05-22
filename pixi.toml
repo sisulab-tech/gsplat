@@ -1,0 +1,56 @@
+[workspace]
+authors = ["Sercan Turkmen <sercan@sisulab.tech>"]
+channels = ["nvidia/label/cuda-12.4.1", "conda-forge"]
+name = "gsplat_personal"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[tasks]
+
+[system-requirements]
+cuda = "12.4"
+libc = "2.31"
+
+[dependencies]
+python = "=3.10"
+gpustat = "*"
+setuptools = "=78.1.0"
+glm = "*"
+numpy = "<2"
+cgal-cpp = ">=6.0.1,<7"
+gmp = "*"
+deno = "=2.1.9"
+pip = ">=25.0.1,<26"
+libgl = ">=1.7.0,<2"  # opencv dependency
+libglib = ">=2.86.0,<3"  # opencv dependency
+libopenblas = { version = "*", build = "*openmp*" }
+cuda-toolkit = "==12.4.1"
+
+[pypi-dependencies]
+tyro = { version = ">=0.9.17" }
+pytest = ">=9.0,<9.1"
+pytest-cov = ">=7.0,<7.1"
+
+ninja = "*"
+imageio = { extras = ["ffmpeg"], version = ">=2.37.0" }
+joblib = { version = ">=1.4.2" }
+matplotlib = { version = "<3.10" }
+nerfview = { git = "https://github.com/nerfstudio-project/nerfview", rev = "4538024fe0d15fd1a0e4d760f3695fc44ca72787" }
+open3d = { version = ">=0.19.0" }
+plyfile = { version = ">=1.1" }
+pyyaml = { version = ">=6.0.2" }
+scikit-learn = { version = ">=1.6.1" }
+tensorboard = { version = ">=2.19.0" }
+tensorly = { version = ">=0.9.0" }
+torch = { version = "==2.5.1", index = "https://download.pytorch.org/whl/cu124" }
+torchmetrics = { version = "*", extras = ["image"], index = "https://download.pytorch.org/whl/cu124" }
+torchvision = { version = "*", index = "https://download.pytorch.org/whl/cu124" }
+tqdm = { version = ">=4.67.1" }
+viser = { version = "*" }
+splines = ">=0.3.2, <0.4"
+opencv-python = { version = ">=4.11,<4.12" }
+pycolmap = { git = "https://github.com/rmbrualla/pycolmap", rev = "cc7ea4b7301720ac29287dbe450952511b32125e" }
+watchtower = { version = ">=3.4.0" }
+einops = ">=0.8.1, <0.9"
+kornia = ">=0.8.2, <0.9"
+romatch = { path = "third_party/RoMa", editable = true }

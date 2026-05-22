@@ -111,6 +111,15 @@ class Config:
     init_num_pts: int = 100_000
     # Initial extent of GSs as a multiple of the camera extent. Ignored if using sfm
     init_extent: float = 3.0
+
+    # EDGS initialization parameters (only used when init_type="edgs")
+    edgs_num_refs: int = 180
+    edgs_nns_per_ref: int = 1
+    edgs_matches_per_ref: int = 15_000
+    edgs_scaling_factor: float = 0.001
+    edgs_proj_err_tolerance: float = 0.01
+    edgs_roma_model: str = "outdoors"
+
     # Degree of spherical harmonics
     sh_degree: int = 3
     # Turn on another SH degree every this steps
@@ -224,6 +233,13 @@ def create_splats_with_optimizers(
     device: str = "cuda",
     world_rank: int = 0,
     world_size: int = 1,
+    trainset: Optional[Dataset] = None,
+    edgs_num_refs: int = 180,
+    edgs_nns_per_ref: int = 1,
+    edgs_matches_per_ref: int = 15_000,
+    edgs_scaling_factor: float = 0.001,
+    edgs_proj_err_tolerance: float = 0.01,
+    edgs_roma_model: str = "outdoors",
 ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
     if init_type == "sfm":
         points = torch.from_numpy(parser.points).float()
@@ -231,13 +247,33 @@ def create_splats_with_optimizers(
     elif init_type == "random":
         points = init_extent * scene_scale * (torch.rand((init_num_pts, 3)) * 2 - 1)
         rgbs = torch.rand((init_num_pts, 3))
-    else:
-        raise ValueError("Please specify a correct init_type: sfm or random")
+    elif init_type == "edgs":
+        from edgs_init import init_edgs
 
-    # Initialize the GS size to be the average dist of the 3 nearest neighbors
-    dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
-    dist_avg = torch.sqrt(dist2_avg)
-    scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
+        assert trainset is not None, (
+            "trainset must be provided for EDGS initialization"
+        )
+        points, rgbs, scales, opacities, quats = init_edgs(
+            parser=parser,
+            trainset=trainset,
+            device=device,
+            num_refs=edgs_num_refs,
+            nns_per_ref=edgs_nns_per_ref,
+            matches_per_ref=edgs_matches_per_ref,
+            scaling_factor=edgs_scaling_factor,
+            proj_err_tolerance=edgs_proj_err_tolerance,
+            roma_model_type=edgs_roma_model,
+        )
+    else:
+        raise ValueError(
+            "Please specify a correct init_type: sfm, random, or edgs"
+        )
+
+    if init_type != "edgs":
+        # Initialize the GS size to be the average dist of the 3 nearest neighbors
+        dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
+        dist_avg = torch.sqrt(dist2_avg)
+        scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
 
     # Distribute the GSs to different ranks (also works for single rank)
     points = points[world_rank::world_size]
@@ -245,8 +281,12 @@ def create_splats_with_optimizers(
     scales = scales[world_rank::world_size]
 
     N = points.shape[0]
-    quats = torch.rand((N, 4))  # [N, 4]
-    opacities = torch.logit(torch.full((N,), init_opacity))  # [N,]
+    if init_type != "edgs":
+        quats = torch.rand((N, 4))  # [N, 4]
+        opacities = torch.logit(torch.full((N,), init_opacity))  # [N,]
+    else:
+        quats = quats[world_rank::world_size]
+        opacities = opacities[world_rank::world_size]
 
     params = [
         # name, value, lr
@@ -361,6 +401,13 @@ class Runner:
             device=self.device,
             world_rank=world_rank,
             world_size=world_size,
+            trainset=self.trainset,
+            edgs_num_refs=cfg.edgs_num_refs,
+            edgs_nns_per_ref=cfg.edgs_nns_per_ref,
+            edgs_matches_per_ref=cfg.edgs_matches_per_ref,
+            edgs_scaling_factor=cfg.edgs_scaling_factor,
+            edgs_proj_err_tolerance=cfg.edgs_proj_err_tolerance,
+            edgs_roma_model=cfg.edgs_roma_model,
         )
         print("Model initialized. Number of GS:", len(self.splats["means"]))
 
