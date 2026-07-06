@@ -721,12 +721,12 @@ def rasterize_to_pixels_eval3d(
         padded_channels = 0
 
     tile_height, tile_width = isect_offsets.shape[1:3]
-    assert (
-        tile_height * tile_size >= image_height
-    ), f"Assert Failed: {tile_height} * {tile_size} >= {image_height}"
-    assert (
-        tile_width * tile_size >= image_width
-    ), f"Assert Failed: {tile_width} * {tile_size} >= {image_width}"
+    assert tile_height * tile_size >= image_height, (
+        f"Assert Failed: {tile_height} * {tile_size} >= {image_height}"
+    )
+    assert tile_width * tile_size >= image_width, (
+        f"Assert Failed: {tile_width} * {tile_size} >= {image_width}"
+    )
 
     render_colors, render_alphas = _RasterizeToPixelsEval3D.apply(
         means.contiguous(),
@@ -1369,9 +1369,13 @@ class _RasterizeToPixelsEval3D(torch.autograd.Function):
         camera_model_type = ctx.camera_model_type
         tile_size = ctx.tile_size
 
-        (v_means, v_quats, v_scales, v_colors, v_opacities,) = _make_lazy_cuda_func(
-            "rasterize_to_pixels_from_world_3dgs_bwd"
-        )(
+        (
+            v_means,
+            v_quats,
+            v_scales,
+            v_colors,
+            v_opacities,
+        ) = _make_lazy_cuda_func("rasterize_to_pixels_from_world_3dgs_bwd")(
             means,
             quats,
             scales,
@@ -2833,3 +2837,487 @@ class _ViewToGaussians(torch.autograd.Function):
 
 def triangulate(points: Tensor) -> Tensor:
     return _make_lazy_cuda_func("triangulate")(points)
+
+
+###############################################################################
+# MeshSplatting opaque-triangle primitive (Approach B, arXiv:2512.06818).
+#
+# Forward + backward (Phases 1-2): the CUDA forward is validated (pixel parity)
+# and the backward is validated (gradient parity) against the pure-PyTorch
+# reference `sisu_040.gsplat.triangle_ref`. sigma is a scheduled scalar with no
+# gradient; faces/viewmats/Ks are constants.
+###############################################################################
+
+
+def fully_fused_projection_triangle(
+    vertices: Tensor,  # [V, 3]
+    faces: Tensor,  # [T, 3] int
+    vertex_opacity: Tensor,  # [V]
+    viewmats: Tensor,  # [C, 4, 4]
+    Ks: Tensor,  # [C, 3, 3]
+    width: int,
+    height: int,
+    near_plane: float = 0.01,
+    far_plane: float = 1e10,
+    eps: float = 1e-8,
+) -> Tuple[
+    Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor
+]:
+    """Project opaque triangles to screen space (MeshSplatting primitive).
+
+    Mirrors ``triangle_ref.project_triangles``. One thread per (camera, triangle)
+    gathers the triangle's 3 shared vertices and emits the screen-space window
+    representation the triangle rasterizer consumes.
+
+    Returns a tuple (all ``[C, T, ...]``):
+
+    - **radii** ``[C, T, 2]`` int — square pixel-radius bbox for tile binning.
+    - **means2d** ``[C, T, 2]`` — projected-vertex centroid.
+    - **depths** ``[C, T]`` — centroid camera-space z (front-to-back sort key).
+    - **vertex_depths** ``[C, T, 3]`` — per-vertex camera-space z, for the
+      rasterizer's barycentric expected/median depth interpolation.
+    - **proj_verts** ``[C, T, 3, 2]`` — the 3 projected vertices.
+    - **edge_normals** ``[C, T, 3, 2]`` — inward unit edge normals.
+    - **edge_offsets** ``[C, T, 3]`` — edge offsets (``n . p + off`` = signed dist).
+    - **phi_center** ``[C, T]`` — window normalization ``1 / dist(incenter -> edge)``.
+    - **opacities** ``[C, T]`` — min activated vertex opacity.
+    - **normals** ``[C, T, 3]`` — camera-facing world-space triangle normal.
+    """
+    C = viewmats.size(0)
+    V = vertices.size(0)
+    T = faces.size(0)
+    assert vertices.size() == (V, 3), vertices.size()
+    assert faces.size() == (T, 3), faces.size()
+    assert vertex_opacity.size() == (V,), vertex_opacity.size()
+    assert viewmats.size() == (C, 4, 4), viewmats.size()
+    assert Ks.size() == (C, 3, 3), Ks.size()
+    return _FullyFusedProjectionTriangle.apply(
+        vertices.contiguous(),
+        faces.contiguous().int(),
+        vertex_opacity.contiguous(),
+        viewmats.contiguous(),
+        Ks.contiguous(),
+        width,
+        height,
+        near_plane,
+        far_plane,
+        eps,
+    )
+
+
+class _FullyFusedProjectionTriangle(torch.autograd.Function):
+    """Projects opaque triangles to screen space; differentiable w.r.t.
+    vertices and vertex opacity (viewmats/Ks/faces are constants)."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        vertices: Tensor,
+        faces: Tensor,
+        vertex_opacity: Tensor,
+        viewmats: Tensor,
+        Ks: Tensor,
+        width: int,
+        height: int,
+        near_plane: float,
+        far_plane: float,
+        eps: float,
+    ) -> Tuple[
+        Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor
+    ]:
+        (
+            radii,
+            means2d,
+            depths,
+            vertex_depths,
+            proj_verts,
+            edge_normals,
+            edge_offsets,
+            phi_center,
+            opacities,
+            normals,
+        ) = _make_lazy_cuda_func("projection_triangle_fwd")(
+            vertices,
+            faces,
+            vertex_opacity,
+            viewmats,
+            Ks,
+            width,
+            height,
+            near_plane,
+            far_plane,
+            eps,
+        )
+        ctx.save_for_backward(vertices, faces, vertex_opacity, viewmats, Ks)
+        ctx.width = width
+        ctx.height = height
+        ctx.near_plane = near_plane
+        ctx.far_plane = far_plane
+        ctx.eps = eps
+        return (
+            radii,
+            means2d,
+            depths,
+            vertex_depths,
+            proj_verts,
+            edge_normals,
+            edge_offsets,
+            phi_center,
+            opacities,
+            normals,
+        )
+
+    @staticmethod
+    def backward(
+        ctx,
+        v_radii: Tensor,
+        v_means2d: Tensor,
+        v_depths: Tensor,
+        v_vertex_depths: Tensor,
+        v_proj_verts: Tensor,
+        v_edge_normals: Tensor,
+        v_edge_offsets: Tensor,
+        v_phi_center: Tensor,
+        v_opacities: Tensor,
+        v_normals: Tensor,
+    ):
+        vertices, faces, vertex_opacity, viewmats, Ks = ctx.saved_tensors
+        C = viewmats.shape[0]
+        T = faces.shape[0]
+        dev, dt = vertices.device, vertices.dtype
+
+        def _g(g, shape):
+            return (
+                torch.zeros(shape, device=dev, dtype=dt)
+                if g is None
+                else g.contiguous()
+            )
+
+        v_means2d = _g(v_means2d, (C, T, 2))
+        v_depths = _g(v_depths, (C, T))
+        v_vertex_depths = _g(v_vertex_depths, (C, T, 3))
+        v_proj_verts = _g(v_proj_verts, (C, T, 3, 2))
+        v_edge_normals = _g(v_edge_normals, (C, T, 3, 2))
+        v_edge_offsets = _g(v_edge_offsets, (C, T, 3))
+        v_phi_center = _g(v_phi_center, (C, T))
+        v_opacities = _g(v_opacities, (C, T))
+        v_normals = _g(v_normals, (C, T, 3))
+
+        v_vertices, v_vertex_opacity = _make_lazy_cuda_func("projection_triangle_bwd")(
+            vertices,
+            faces,
+            vertex_opacity,
+            viewmats,
+            Ks,
+            ctx.width,
+            ctx.height,
+            ctx.near_plane,
+            ctx.far_plane,
+            ctx.eps,
+            v_means2d,
+            v_depths,
+            v_vertex_depths,
+            v_proj_verts,
+            v_edge_normals,
+            v_edge_offsets,
+            v_phi_center,
+            v_opacities,
+            v_normals,
+        )
+        # Order matches forward inputs. faces/viewmats/Ks and the scalars are
+        # treated as constants (no gradient).
+        return (
+            v_vertices,
+            None,  # faces
+            v_vertex_opacity,
+            None,  # viewmats
+            None,  # Ks
+            None,  # width
+            None,  # height
+            None,  # near_plane
+            None,  # far_plane
+            None,  # eps
+        )
+
+
+def rasterize_to_pixels_triangle(
+    proj_verts: Tensor,  # [C, T, 3, 2]
+    edge_normals: Tensor,  # [C, T, 3, 2]
+    edge_offsets: Tensor,  # [C, T, 3]
+    phi_center: Tensor,  # [C, T]
+    opacities: Tensor,  # [C, T]
+    colors: Tensor,  # [C, T, 3, CDIM] (3 per-vertex colors per triangle)
+    normals: Tensor,  # [C, T, 3]
+    vertex_depths: Tensor,  # [C, T, 3] (3 per-vertex view-z per triangle)
+    image_width: int,
+    image_height: int,
+    tile_size: int,
+    isect_offsets: Tensor,  # [C, tile_height, tile_width]
+    flatten_ids: Tensor,  # [n_isects]
+    sigma: float = 2.0,
+    eps: float = 1e-8,
+    backgrounds: Optional[Tensor] = None,  # [C, CDIM]
+    masks: Optional[Tensor] = None,  # [C, tile_height, tile_width]
+) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """Rasterize opaque triangles to pixels (front-to-back window compositing).
+
+    Mirrors ``triangle_ref.render_triangles``. Returns
+    ``(render_colors [C,H,W,CDIM], render_alphas [C,H,W,1],
+    render_normals [C,H,W,3], render_depths [C,H,W,1], render_median [C,H,W,1],
+    last_ids [C,H,W], median_ids [C,H,W], max_blending [C,T],
+    pixel_count [C,T])``. ``render_depths`` is the alpha-weighted **expected**
+    depth and ``render_median`` the **median (surf)** depth; both interpolate the
+    per-vertex ``vertex_depths`` barycentrically, matching the reference. The
+    last four (ids + stats) are detached and not differentiable.
+    """
+    C = isect_offsets.size(0)
+    T = proj_verts.size(1)
+    assert proj_verts.shape == (C, T, 3, 2), proj_verts.shape
+    assert edge_normals.shape == (C, T, 3, 2), edge_normals.shape
+    assert edge_offsets.shape == (C, T, 3), edge_offsets.shape
+    assert phi_center.shape == (C, T), phi_center.shape
+    assert opacities.shape == (C, T), opacities.shape
+    assert colors.shape[:3] == (C, T, 3), colors.shape
+    assert vertex_depths.shape == (C, T, 3), vertex_depths.shape
+    if backgrounds is not None:
+        assert backgrounds.shape == (C, colors.shape[-1]), backgrounds.shape
+        backgrounds = backgrounds.contiguous()
+    if masks is not None:
+        masks = masks.contiguous()
+
+    tile_height, tile_width = isect_offsets.shape[1:3]
+    assert tile_height * tile_size >= image_height
+    assert tile_width * tile_size >= image_width
+
+    return _RasterizeToPixelsTriangle.apply(
+        proj_verts.contiguous(),
+        edge_normals.contiguous(),
+        edge_offsets.contiguous(),
+        phi_center.contiguous(),
+        opacities.contiguous(),
+        colors.contiguous(),
+        normals.contiguous(),
+        vertex_depths.contiguous(),
+        sigma,
+        eps,
+        backgrounds,
+        masks,
+        image_width,
+        image_height,
+        tile_size,
+        isect_offsets.contiguous(),
+        flatten_ids.contiguous(),
+    )
+
+
+class _RasterizeToPixelsTriangle(torch.autograd.Function):
+    """Rasterize opaque triangles; differentiable w.r.t. the projected-triangle
+    quantities and colors (sigma is a scheduled scalar, no gradient)."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        proj_verts: Tensor,
+        edge_normals: Tensor,
+        edge_offsets: Tensor,
+        phi_center: Tensor,
+        opacities: Tensor,
+        colors: Tensor,
+        normals: Tensor,
+        vertex_depths: Tensor,
+        sigma: float,
+        eps: float,
+        backgrounds: Optional[Tensor],
+        masks: Optional[Tensor],
+        image_width: int,
+        image_height: int,
+        tile_size: int,
+        isect_offsets: Tensor,
+        flatten_ids: Tensor,
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+        (
+            render_colors,
+            render_alphas,
+            render_normals,
+            render_depths,
+            render_median,
+            last_ids,
+            median_ids,
+            max_blending,
+            pixel_count,
+        ) = _make_lazy_cuda_func("rasterize_to_pixels_triangle_fwd")(
+            proj_verts,
+            edge_normals,
+            edge_offsets,
+            phi_center,
+            opacities,
+            colors,
+            normals,
+            vertex_depths,
+            sigma,
+            eps,
+            backgrounds,
+            masks,
+            image_width,
+            image_height,
+            tile_size,
+            isect_offsets,
+            flatten_ids,
+        )
+        # Detached ids + densification stats — no gradient path.
+        ctx.mark_non_differentiable(
+            last_ids, median_ids, max_blending, pixel_count
+        )
+        ctx.save_for_backward(
+            proj_verts,
+            edge_normals,
+            edge_offsets,
+            phi_center,
+            opacities,
+            colors,
+            normals,
+            vertex_depths,
+            backgrounds,
+            masks,
+            isect_offsets,
+            flatten_ids,
+            render_alphas,
+            last_ids,
+            median_ids,
+        )
+        ctx.sigma = sigma
+        ctx.eps = eps
+        ctx.image_width = image_width
+        ctx.image_height = image_height
+        ctx.tile_size = tile_size
+        return (
+            render_colors,
+            render_alphas,
+            render_normals,
+            render_depths,
+            render_median,
+            last_ids,
+            median_ids,
+            max_blending,
+            pixel_count,
+        )
+
+    @staticmethod
+    def backward(
+        ctx,
+        v_render_colors: Tensor,
+        v_render_alphas: Tensor,
+        v_render_normals: Tensor,
+        v_render_depths: Tensor,
+        v_render_median: Tensor,
+        v_last_ids: Tensor,
+        v_median_ids: Tensor,
+        v_max_blending: Tensor,
+        v_pixel_count: Tensor,
+    ):
+        (
+            proj_verts,
+            edge_normals,
+            edge_offsets,
+            phi_center,
+            opacities,
+            colors,
+            normals,
+            vertex_depths,
+            backgrounds,
+            masks,
+            isect_offsets,
+            flatten_ids,
+            render_alphas,
+            last_ids,
+            median_ids,
+        ) = ctx.saved_tensors
+
+        # Some render outputs may be unused by the loss (e.g. normals); their
+        # upstream grad is then None. Rebuild zeros from the render shape.
+        C, H, W, _ = render_alphas.shape
+        CDIM = colors.shape[-1]
+        dev, dt = colors.device, colors.dtype
+        v_render_colors = (
+            torch.zeros((C, H, W, CDIM), device=dev, dtype=dt)
+            if v_render_colors is None
+            else v_render_colors.contiguous()
+        )
+        v_render_alphas = (
+            torch.zeros((C, H, W, 1), device=dev, dtype=dt)
+            if v_render_alphas is None
+            else v_render_alphas.contiguous()
+        )
+        v_render_normals = (
+            torch.zeros((C, H, W, 3), device=dev, dtype=dt)
+            if v_render_normals is None
+            else v_render_normals.contiguous()
+        )
+        v_render_depths = (
+            torch.zeros((C, H, W, 1), device=dev, dtype=dt)
+            if v_render_depths is None
+            else v_render_depths.contiguous()
+        )
+        v_render_median = (
+            torch.zeros((C, H, W, 1), device=dev, dtype=dt)
+            if v_render_median is None
+            else v_render_median.contiguous()
+        )
+
+        (
+            v_proj_verts,
+            v_edge_normals,
+            v_edge_offsets,
+            v_phi_center,
+            v_opacities,
+            v_colors,
+            v_normals,
+            v_vertex_depths,
+        ) = _make_lazy_cuda_func("rasterize_to_pixels_triangle_bwd")(
+            proj_verts,
+            edge_normals,
+            edge_offsets,
+            phi_center,
+            opacities,
+            colors,
+            normals,
+            vertex_depths,
+            ctx.sigma,
+            ctx.eps,
+            backgrounds,
+            masks,
+            ctx.image_width,
+            ctx.image_height,
+            ctx.tile_size,
+            isect_offsets,
+            flatten_ids,
+            render_alphas,
+            last_ids,
+            median_ids,
+            v_render_colors,
+            v_render_alphas,
+            v_render_normals,
+            v_render_depths,
+            v_render_median,
+        )
+        # Order matches the forward inputs; only the 8 projection/color tensors
+        # receive gradients. sigma/eps/backgrounds/masks/geometry are constant.
+        return (
+            v_proj_verts,
+            v_edge_normals,
+            v_edge_offsets,
+            v_phi_center,
+            v_opacities,
+            v_colors,
+            v_normals,
+            v_vertex_depths,
+            None,  # sigma
+            None,  # eps
+            None,  # backgrounds
+            None,  # masks
+            None,  # image_width
+            None,  # image_height
+            None,  # tile_size
+            None,  # isect_offsets
+            None,  # flatten_ids
+        )

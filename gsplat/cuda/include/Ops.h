@@ -622,4 +622,121 @@ at::Tensor view_to_gaussians_fwd_tensor(
 
 at::Tensor py_triangulate(const at::Tensor &points);
 
+// Projection + rasterization for the opaque-triangle (MeshSplatting) primitive.
+std::tuple<
+    at::Tensor, // radii
+    at::Tensor, // means2d
+    at::Tensor, // depths
+    at::Tensor, // vertex_depths
+    at::Tensor, // proj_verts
+    at::Tensor, // edge_normals
+    at::Tensor, // edge_offsets
+    at::Tensor, // phi_center
+    at::Tensor, // opacities
+    at::Tensor> // normals
+projection_triangle_fwd(
+    const at::Tensor vertices,       // [V, 3]
+    const at::Tensor faces,          // [T, 3]
+    const at::Tensor vertex_opacity, // [V]
+    const at::Tensor viewmats,       // [C, 4, 4]
+    const at::Tensor Ks,             // [C, 3, 3]
+    const uint32_t image_width,
+    const uint32_t image_height,
+    const float near_plane,
+    const float far_plane,
+    const float eps
+);
+
+std::tuple<
+    at::Tensor, // render_colors
+    at::Tensor, // render_alphas
+    at::Tensor, // render_normals
+    at::Tensor, // render_depths
+    at::Tensor, // render_median
+    at::Tensor, // last_ids
+    at::Tensor, // median_ids
+    at::Tensor, // max_blending  [C, T]
+    at::Tensor> // pixel_count   [C, T]
+rasterize_to_pixels_triangle_fwd(
+    const at::Tensor proj_verts,    // [C, T, 3, 2]
+    const at::Tensor edge_normals,  // [C, T, 3, 2]
+    const at::Tensor edge_offsets,  // [C, T, 3]
+    const at::Tensor phi_center,    // [C, T]
+    const at::Tensor opacities,     // [C, T]
+    const at::Tensor colors,        // [C, T, 3, CDIM]
+    const at::Tensor normals,       // [C, T, 3]
+    const at::Tensor vertex_depths, // [C, T, 3]
+    const double sigma,
+    const double eps,
+    const at::optional<at::Tensor> backgrounds, // [C, CDIM]
+    const at::optional<at::Tensor> masks,       // [C, tile_height, tile_width]
+    const uint32_t image_width,
+    const uint32_t image_height,
+    const uint32_t tile_size,
+    const at::Tensor tile_offsets, // [C, tile_height, tile_width]
+    const at::Tensor flatten_ids   // [n_isects]
+);
+
+std::tuple<
+    at::Tensor, // v_vertices
+    at::Tensor> // v_vertex_opacity
+projection_triangle_bwd(
+    const at::Tensor vertices,       // [V, 3]
+    const at::Tensor faces,          // [T, 3]
+    const at::Tensor vertex_opacity, // [V]
+    const at::Tensor viewmats,       // [C, 4, 4]
+    const at::Tensor Ks,             // [C, 3, 3]
+    const int64_t image_width,
+    const int64_t image_height,
+    const double near_plane,
+    const double far_plane,
+    const double eps,
+    const at::Tensor v_means2d,       // [C, T, 2]
+    const at::Tensor v_depths,        // [C, T]
+    const at::Tensor v_vertex_depths, // [C, T, 3]
+    const at::Tensor v_proj_verts,    // [C, T, 3, 2]
+    const at::Tensor v_edge_normals,  // [C, T, 3, 2]
+    const at::Tensor v_edge_offsets,  // [C, T, 3]
+    const at::Tensor v_phi_center,    // [C, T]
+    const at::Tensor v_opacities,     // [C, T]
+    const at::Tensor v_normals        // [C, T, 3]
+);
+
+std::tuple<
+    at::Tensor, // v_proj_verts
+    at::Tensor, // v_edge_normals
+    at::Tensor, // v_edge_offsets
+    at::Tensor, // v_phi_center
+    at::Tensor, // v_opacities
+    at::Tensor, // v_colors
+    at::Tensor, // v_normals
+    at::Tensor> // v_vertex_depths
+rasterize_to_pixels_triangle_bwd(
+    const at::Tensor proj_verts,    // [C, T, 3, 2]
+    const at::Tensor edge_normals,  // [C, T, 3, 2]
+    const at::Tensor edge_offsets,  // [C, T, 3]
+    const at::Tensor phi_center,    // [C, T]
+    const at::Tensor opacities,     // [C, T]
+    const at::Tensor colors,        // [C, T, 3, CDIM]
+    const at::Tensor normals,       // [C, T, 3]
+    const at::Tensor vertex_depths, // [C, T, 3]
+    const double sigma,
+    const double eps,
+    const at::optional<at::Tensor> backgrounds, // [C, CDIM]
+    const at::optional<at::Tensor> masks,       // [C, tile_height, tile_width]
+    const uint32_t image_width,
+    const uint32_t image_height,
+    const uint32_t tile_size,
+    const at::Tensor tile_offsets,     // [C, tile_height, tile_width]
+    const at::Tensor flatten_ids,      // [n_isects]
+    const at::Tensor render_alphas,    // [C, H, W, 1]
+    const at::Tensor last_ids,         // [C, H, W]
+    const at::Tensor median_ids,       // [C, H, W]
+    const at::Tensor v_render_colors,  // [C, H, W, CDIM]
+    const at::Tensor v_render_alphas,  // [C, H, W, 1]
+    const at::Tensor v_render_normals, // [C, H, W, 3]
+    const at::Tensor v_render_depths,  // [C, H, W, 1]
+    const at::Tensor v_render_median   // [C, H, W, 1]
+);
+
 } // namespace gsplat

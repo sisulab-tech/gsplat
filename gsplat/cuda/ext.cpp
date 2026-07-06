@@ -99,4 +99,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     // tetra-nerf
     m.def("triangulate", &gsplat::py_triangulate);
+
+    // MeshSplatting opaque-triangle primitive
+    m.def("projection_triangle_fwd", &gsplat::projection_triangle_fwd);
+    m.def(
+        "rasterize_to_pixels_triangle_fwd",
+        &gsplat::rasterize_to_pixels_triangle_fwd
+    );
+    m.def("projection_triangle_bwd", &gsplat::projection_triangle_bwd);
+    m.def(
+        "rasterize_to_pixels_triangle_bwd",
+        &gsplat::rasterize_to_pixels_triangle_bwd
+    );
 }

@@ -11,6 +11,7 @@ from .cuda._wrapper import (
     RollingShutterType,
     fully_fused_projection,
     fully_fused_projection_2dgs,
+    fully_fused_projection_triangle,
     fully_fused_projection_with_ut,
     integrate_to_points,
     isect_offset_encode,
@@ -20,6 +21,7 @@ from .cuda._wrapper import (
     rasterize_to_pixels,
     rasterize_to_pixels_2dgs,
     rasterize_to_pixels_eval3d,
+    rasterize_to_pixels_triangle,
     spherical_harmonics,
     view_to_gaussians,
 )
@@ -1856,3 +1858,129 @@ def integration(
         "tile_size": tile_size,
     }
     return integrated_colors, integrated_alphas, meta
+
+
+def rasterization_triangle(
+    vertices: Tensor,  # [V, 3]
+    faces: Tensor,  # [T, 3] int
+    vertex_colors: Tensor,  # [V, CDIM] or [C, V, CDIM] (already-evaluated colors)
+    vertex_opacity: Tensor,  # [V]  (pre-activation logits)
+    viewmats: Tensor,  # [C, 4, 4]
+    Ks: Tensor,  # [C, 3, 3]
+    width: int,
+    height: int,
+    sigma: float = 2.0,
+    near_plane: float = 0.01,
+    far_plane: float = 1e10,
+    eps: float = 1e-8,
+    tile_size: int = 16,
+    backgrounds: Optional[Tensor] = None,  # [C, CDIM]
+) -> Tuple[Tensor, Tensor, Tensor, Dict]:
+    """Rasterize an opaque-triangle soup (MeshSplatting, Approach B).
+
+    Chains ``projection_triangle -> isect_tiles -> rasterize_to_pixels_triangle``,
+    parallel to :func:`rasterization_2dgs`. ``vertex_colors`` are already-evaluated
+    RGB (SH evaluation is the caller's responsibility); they may be camera-shared
+    ``[V, CDIM]`` or **view-dependent** ``[C, V, CDIM]`` (one color set per camera,
+    as produced by per-camera SH evaluation). Per-triangle vertex colors are
+    gathered as ``vertex_colors[faces]`` and barycentrically interpolated per pixel
+    inside the kernel.
+
+    Returns ``(render_colors [C,H,W,CDIM], render_alphas [C,H,W,1],
+    render_depths [C,H,W,1], meta)``.
+    """
+    C = viewmats.size(0)
+
+    (
+        radii,
+        means2d,
+        depths,
+        vertex_depths,
+        proj_verts,
+        edge_normals,
+        edge_offsets,
+        phi_center,
+        opacities,
+        normals,
+    ) = fully_fused_projection_triangle(
+        vertices,
+        faces,
+        vertex_opacity,
+        viewmats,
+        Ks,
+        width,
+        height,
+        near_plane=near_plane,
+        far_plane=far_plane,
+        eps=eps,
+    )
+
+    tile_width = math.ceil(width / float(tile_size))
+    tile_height = math.ceil(height / float(tile_size))
+    _, isect_ids, flatten_ids = isect_tiles(
+        means2d, radii, depths, tile_size, tile_width, tile_height
+    )
+    isect_offsets = isect_offset_encode(isect_ids, C, tile_width, tile_height)
+
+    # Per-triangle vertex colors: [C, T, 3, CDIM]. Support both camera-shared
+    # colors [V, CDIM] (broadcast across cameras) and view-dependent per-camera
+    # colors [C, V, CDIM] (gathered independently per camera).
+    if vertex_colors.dim() == 3:  # [C, V, CDIM]
+        assert vertex_colors.shape[0] == C, vertex_colors.shape
+        tri_colors = vertex_colors[:, faces]  # [C, T, 3, CDIM]
+    else:  # [V, CDIM]
+        tri_colors = vertex_colors[faces].unsqueeze(0).expand(C, -1, -1, -1)
+
+    (
+        render_colors,
+        render_alphas,
+        render_normals,
+        render_depths,
+        render_median,
+        last_ids,
+        median_ids,
+        max_blending,
+        pixel_count,
+    ) = rasterize_to_pixels_triangle(
+        proj_verts,
+        edge_normals,
+        edge_offsets,
+        phi_center,
+        opacities,
+        tri_colors,
+        normals,
+        vertex_depths,
+        width,
+        height,
+        tile_size,
+        isect_offsets,
+        flatten_ids,
+        sigma=sigma,
+        eps=eps,
+        backgrounds=backgrounds,
+    )
+
+    meta = {
+        "radii": radii,
+        "means2d": means2d,
+        "depths": depths,
+        "proj_verts": proj_verts,
+        "opacities": opacities,
+        # Aux maps (2DGS allmap-equivalent): world-space accumulated normal,
+        # alpha-weighted expected depth, median (surf) depth. The depth maps
+        # interpolate per-vertex view-z barycentrically (reference forward).
+        "render_normals": render_normals,
+        "render_depths": render_depths,
+        "render_median": render_median,
+        "render_alphas": render_alphas,
+        "last_ids": last_ids,
+        "median_ids": median_ids,
+        # Detached per-(camera, triangle) densification stats.
+        "max_blending": max_blending,
+        "pixel_count": pixel_count,
+        "tile_size": tile_size,
+        "tile_width": tile_width,
+        "tile_height": tile_height,
+        "n_isects": len(flatten_ids),
+    }
+    return render_colors, render_alphas, render_depths, meta
