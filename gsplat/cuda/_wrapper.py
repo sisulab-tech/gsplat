@@ -616,6 +616,300 @@ def rasterize_to_pixels(
     return render_colors, render_alphas
 
 
+def rasterize_to_pixels_geom(
+    means2d: Tensor,  # [C, N, 2] or [nnz, 2]
+    conics: Tensor,  # [C, N, 3] or [nnz, 3]
+    colors: Tensor,  # [C, N, channels] or [nnz, channels]
+    opacities: Tensor,  # [C, N] or [nnz]
+    ray_planes: Tensor,  # [C, N, 3] or [nnz, 3]
+    Ks: Tensor,  # [C, 3, 3]
+    image_width: int,
+    image_height: int,
+    tile_size: int,
+    isect_offsets: Tensor,  # [C, tile_height, tile_width]
+    flatten_ids: Tensor,  # [n_isects]
+    backgrounds: Optional[Tensor] = None,  # [C, channels]
+    masks: Optional[Tensor] = None,  # [C, tile_height, tile_width]
+    packed: bool = False,
+    absgrad: bool = False,
+    distort_near: float = 0.2,
+    distort_far: float = 100.0,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """Rasterizes Gaussians to pixels with RaDe-GS geometry outputs.
+
+    On top of :func:`rasterize_to_pixels` this composites the RaDe-GS
+    (arXiv:2406.01467) closed-form ray-Gaussian intersection depth. The
+    per-Gaussian ``ray_planes`` come from
+    ``gsplat.cuda._torch_impl_radegs.compute_ray_planes`` (differentiable
+    torch; its backward is handled by autograd — this op only propagates
+    gradients *to* ``ray_planes``).
+
+    Normals are plain channel blending: append them to ``colors``.
+
+    Args:
+        ray_planes: Per-Gaussian depth linearization; the per-pixel
+            intersection distance is ``rp.x * dx + rp.y * dy + rp.z`` with
+            ``(dx, dy) = mean2d - pixel``. [C, N, 3] or [nnz, 3]
+        Ks: Camera intrinsics, used to convert ray distance to z-depth
+            per pixel. [C, 3, 3]
+        distort_near/distort_far: Range for the 2DGS/GOF NDC depth mapping
+            of the distortion accumulator (GOF hardcodes 0.2/100).
+
+    Returns:
+        A tuple:
+
+        - **Rendered colors**. [C, image_height, image_width, channels]
+        - **Rendered alphas**. [C, image_height, image_width, 1]
+        - **Expected plane depths** (z-depth, alpha-weighted accumulation,
+          NOT normalized by alpha). [C, image_height, image_width, 1]
+        - **Median plane depths** (z-depth at the last Gaussian with
+          pre-composite transmittance > 0.5). [C, image_height, image_width, 1]
+        - **Distortions** (raw GOF accumulator, before the ``/(1-T)^2``
+          normalization). [C, image_height, image_width, 1]
+    """
+
+    C = isect_offsets.size(0)
+    device = means2d.device
+    if packed:
+        nnz = means2d.size(0)
+        assert means2d.shape == (nnz, 2), means2d.shape
+        assert conics.shape == (nnz, 3), conics.shape
+        assert colors.shape[0] == nnz, colors.shape
+        assert opacities.shape == (nnz,), opacities.shape
+        assert ray_planes.shape == (nnz, 3), ray_planes.shape
+    else:
+        N = means2d.size(1)
+        assert means2d.shape == (C, N, 2), means2d.shape
+        assert conics.shape == (C, N, 3), conics.shape
+        assert colors.shape[:2] == (C, N), colors.shape
+        assert opacities.shape == (C, N), opacities.shape
+        assert ray_planes.shape == (C, N, 3), ray_planes.shape
+    assert Ks.shape == (C, 3, 3), Ks.shape
+    if backgrounds is not None:
+        assert backgrounds.shape == (C, colors.shape[-1]), backgrounds.shape
+        backgrounds = backgrounds.contiguous()
+    if masks is not None:
+        assert masks.shape == isect_offsets.shape, masks.shape
+        masks = masks.contiguous()
+
+    # Pad the channels to the nearest supported number if necessary
+    channels = colors.shape[-1]
+    if channels > 33 or channels == 0:
+        raise ValueError(f"Unsupported number of color channels: {channels}")
+    if channels not in (1, 2, 3, 4, 5, 8, 9, 16, 17, 32, 33):
+        padded_channels = (1 << (channels - 1).bit_length()) - channels
+        colors = torch.cat(
+            [
+                colors,
+                torch.zeros(*colors.shape[:-1], padded_channels, device=device),
+            ],
+            dim=-1,
+        )
+        if backgrounds is not None:
+            backgrounds = torch.cat(
+                [
+                    backgrounds,
+                    torch.zeros(
+                        *backgrounds.shape[:-1], padded_channels, device=device
+                    ),
+                ],
+                dim=-1,
+            )
+    else:
+        padded_channels = 0
+
+    tile_height, tile_width = isect_offsets.shape[1:3]
+    assert tile_height * tile_size >= image_height, (
+        f"Assert Failed: {tile_height} * {tile_size} >= {image_height}"
+    )
+    assert tile_width * tile_size >= image_width, (
+        f"Assert Failed: {tile_width} * {tile_size} >= {image_width}"
+    )
+
+    (
+        render_colors,
+        render_alphas,
+        render_edepths,
+        render_mdepths,
+        render_distorts,
+    ) = _RasterizeToPixelsGeom.apply(
+        means2d.contiguous(),
+        conics.contiguous(),
+        colors.contiguous(),
+        opacities.contiguous(),
+        ray_planes.contiguous(),
+        Ks.contiguous().float(),
+        backgrounds,
+        masks,
+        image_width,
+        image_height,
+        tile_size,
+        isect_offsets.contiguous(),
+        flatten_ids.contiguous(),
+        absgrad,
+        distort_near,
+        distort_far,
+    )
+
+    if padded_channels > 0:
+        render_colors = render_colors[..., :-padded_channels]
+    return (
+        render_colors,
+        render_alphas,
+        render_edepths,
+        render_mdepths,
+        render_distorts,
+    )
+
+
+def rasterize_to_pixels_eval3d_geom(
+    view2gaussians: Tensor,  # [C, N, 10]
+    means2d: Tensor,  # [C, N, 2]
+    conics: Tensor,  # [C, N, 3]
+    colors: Tensor,  # [C, N, channels]
+    opacities: Tensor,  # [C, N]
+    Ks: Tensor,  # [C, 3, 3]
+    image_width: int,
+    image_height: int,
+    tile_size: int,
+    isect_offsets: Tensor,  # [C, tile_height, tile_width]
+    flatten_ids: Tensor,  # [n_isects]
+    backgrounds: Optional[Tensor] = None,  # [C, channels]
+    masks: Optional[Tensor] = None,  # [C, tile_height, tile_width]
+    distort_near: float = 0.2,
+    distort_far: float = 100.0,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """Rasterizes Gaussians with GOF eval3d geometry outputs.
+
+    Port of GOF's training rasterizer (arXiv:2404.10772, ``renderCUDA``):
+    color AND geometry composite with the peak 3D response along the
+    camera-space pixel ray, evaluated from the per-(camera, Gaussian)
+    ``view2gaussians`` quadric (see
+    ``gsplat.cuda._torch_impl_radegs.compute_view2gaussians``,
+    differentiable torch; this op only propagates gradients *to*
+    ``view2gaussians``).
+
+    Unlike :func:`rasterize_to_pixels_geom` normals are per-PIXEL
+    (``-normalize(M r)``), so they have a dedicated output instead of
+    riding the color channels.
+
+    ``means2d`` / ``conics`` are consumed only in the backward pass for
+    GOF's conic-based densification signal: the backward stashes
+    ``means2d.absgrad`` (component-wise absolute, gsplat convention) but
+    returns NO autograd gradient for either — exactly like GOF, whose
+    preprocess backward ignores ``dL_dmean2D``. Strategies must read
+    ``absgrad`` when training with this op.
+
+    Args:
+        view2gaussians: Per-Gaussian camera-space quadric packing
+            ``[M00, M01, M02, M11, M12, M22, b0, b1, b2, c]``. [C, N, 10]
+        Ks: Camera intrinsics; pixel rays use the true principal point.
+            [C, 3, 3]
+        distort_near/distort_far: GOF near-plane skip depth and the range
+            of the 2DGS/GOF NDC mapping of the distortion accumulator
+            (GOF hardcodes 0.2/100).
+
+    Returns:
+        A tuple:
+
+        - **Rendered colors**. [C, image_height, image_width, channels]
+        - **Rendered alphas**. [C, image_height, image_width, 1]
+        - **Rendered normals** (camera-space, alpha-weighted accumulation,
+          NOT normalized by alpha). [C, image_height, image_width, 3]
+        - **Expected depths** (z-depth, alpha-weighted accumulation, NOT
+          normalized by alpha). [C, image_height, image_width, 1]
+        - **Median depths** (z-depth at the last Gaussian with
+          pre-composite transmittance > 0.5). [C, image_height, image_width, 1]
+        - **Distortions** (raw GOF accumulator, before the ``/(1-T)^2``
+          normalization). [C, image_height, image_width, 1]
+    """
+    C = isect_offsets.size(0)
+    device = view2gaussians.device
+    N = view2gaussians.size(1)
+    assert view2gaussians.shape == (C, N, 10), view2gaussians.shape
+    assert means2d.shape == (C, N, 2), means2d.shape
+    assert conics.shape == (C, N, 3), conics.shape
+    assert colors.shape[:2] == (C, N), colors.shape
+    assert opacities.shape == (C, N), opacities.shape
+    assert Ks.shape == (C, 3, 3), Ks.shape
+    if backgrounds is not None:
+        assert backgrounds.shape == (C, colors.shape[-1]), backgrounds.shape
+        backgrounds = backgrounds.contiguous()
+    if masks is not None:
+        assert masks.shape == isect_offsets.shape, masks.shape
+        masks = masks.contiguous()
+
+    # Pad the channels to the nearest supported number if necessary
+    channels = colors.shape[-1]
+    if channels > 33 or channels == 0:
+        raise ValueError(f"Unsupported number of color channels: {channels}")
+    if channels not in (1, 2, 3, 4, 5, 8, 9, 16, 17, 32, 33):
+        padded_channels = (1 << (channels - 1).bit_length()) - channels
+        colors = torch.cat(
+            [
+                colors,
+                torch.zeros(*colors.shape[:-1], padded_channels, device=device),
+            ],
+            dim=-1,
+        )
+        if backgrounds is not None:
+            backgrounds = torch.cat(
+                [
+                    backgrounds,
+                    torch.zeros(
+                        *backgrounds.shape[:-1], padded_channels, device=device
+                    ),
+                ],
+                dim=-1,
+            )
+    else:
+        padded_channels = 0
+
+    tile_height, tile_width = isect_offsets.shape[1:3]
+    assert tile_height * tile_size >= image_height, (
+        f"Assert Failed: {tile_height} * {tile_size} >= {image_height}"
+    )
+    assert tile_width * tile_size >= image_width, (
+        f"Assert Failed: {tile_width} * {tile_size} >= {image_width}"
+    )
+
+    (
+        render_colors,
+        render_alphas,
+        render_normals,
+        render_edepths,
+        render_mdepths,
+        render_distorts,
+    ) = _RasterizeToPixelsEval3DGeom.apply(
+        view2gaussians.contiguous(),
+        means2d.contiguous(),
+        conics.contiguous(),
+        colors.contiguous(),
+        opacities.contiguous(),
+        Ks.contiguous().float(),
+        backgrounds,
+        masks,
+        image_width,
+        image_height,
+        tile_size,
+        isect_offsets.contiguous(),
+        flatten_ids.contiguous(),
+        distort_near,
+        distort_far,
+    )
+
+    if padded_channels > 0:
+        render_colors = render_colors[..., :-padded_channels]
+    return (
+        render_colors,
+        render_alphas,
+        render_normals,
+        render_edepths,
+        render_mdepths,
+        render_distorts,
+    )
+
+
 def rasterize_to_pixels_eval3d(
     means: Tensor,  # [N, 3]
     quats: Tensor,  # [N, 4]
@@ -772,6 +1066,7 @@ def rasterize_to_indices_in_range(
     tile_size: int,
     isect_offsets: Tensor,  # [C, tile_height, tile_width]
     flatten_ids: Tensor,  # [n_isects]
+    visibility_threshold: float = 0.0,
 ) -> Tuple[Tensor, Tensor, Tensor]:
     """Rasterizes a batch of Gaussians to images but only returns the indices.
 
@@ -794,6 +1089,10 @@ def rasterize_to_indices_in_range(
         tile_size: Tile size.
         isect_offsets: Intersection offsets outputs from `isect_offset_encode()`. [C, tile_height, tile_width]
         flatten_ids: The global flatten indices in [C * N] from  `isect_tiles()`. [n_isects]
+        visibility_threshold: If > 0, a gaussian is recorded for a pixel only while the
+            pre-composite transmittance at that pixel exceeds this threshold, mirroring PGSR's
+            ``out_observe`` front-visibility count (``T > 0.5``). The default 0.0 records all
+            contributors (down to full opacity), preserving prior behaviour.
 
     Returns:
         A tuple:
@@ -819,6 +1118,7 @@ def rasterize_to_indices_in_range(
     out_gauss_ids, out_indices = _make_lazy_cuda_func("rasterize_to_indices_3dgs")(
         range_start,
         range_end,
+        float(visibility_threshold),
         transmittances.contiguous(),
         means2d.contiguous(),
         conics.contiguous(),
@@ -1115,6 +1415,359 @@ def fully_fused_projection_with_ut(
     if not calc_compensations:
         compensations = None
     return radii, means2d, depths, conics, compensations
+
+
+class _RasterizeToPixelsGeom(torch.autograd.Function):
+    """Rasterize gaussians with RaDe-GS geometry outputs."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        means2d: Tensor,  # [C, N, 2]
+        conics: Tensor,  # [C, N, 3]
+        colors: Tensor,  # [C, N, D]
+        opacities: Tensor,  # [C, N]
+        ray_planes: Tensor,  # [C, N, 3]
+        Ks: Tensor,  # [C, 3, 3]
+        backgrounds: Tensor,  # [C, D], Optional
+        masks: Tensor,  # [C, tile_height, tile_width], Optional
+        width: int,
+        height: int,
+        tile_size: int,
+        isect_offsets: Tensor,  # [C, tile_height, tile_width]
+        flatten_ids: Tensor,  # [n_isects]
+        absgrad: bool,
+        distort_near: float,
+        distort_far: float,
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        (
+            render_colors,
+            render_alphas,
+            last_ids,
+            render_edepths,
+            render_mdepths,
+            median_ids,
+            render_distorts,
+            dist_accums,
+        ) = _make_lazy_cuda_func("rasterize_to_pixels_3dgs_geom_fwd")(
+            means2d,
+            conics,
+            colors,
+            opacities,
+            ray_planes,
+            Ks,
+            distort_near,
+            distort_far,
+            backgrounds,
+            masks,
+            width,
+            height,
+            tile_size,
+            isect_offsets,
+            flatten_ids,
+        )
+
+        ctx.save_for_backward(
+            means2d,
+            conics,
+            colors,
+            opacities,
+            ray_planes,
+            Ks,
+            backgrounds,
+            masks,
+            isect_offsets,
+            flatten_ids,
+            render_alphas,
+            last_ids,
+            median_ids,
+            dist_accums,
+        )
+        ctx.width = width
+        ctx.height = height
+        ctx.tile_size = tile_size
+        ctx.absgrad = absgrad
+        ctx.distort_near = distort_near
+        ctx.distort_far = distort_far
+
+        render_alphas = render_alphas.float()
+        return (
+            render_colors,
+            render_alphas,
+            render_edepths,
+            render_mdepths,
+            render_distorts,
+        )
+
+    @staticmethod
+    def backward(
+        ctx,
+        v_render_colors: Tensor,  # [C, H, W, D]
+        v_render_alphas: Tensor,  # [C, H, W, 1]
+        v_render_edepths: Tensor,  # [C, H, W, 1]
+        v_render_mdepths: Tensor,  # [C, H, W, 1]
+        v_render_distorts: Tensor,  # [C, H, W, 1]
+    ):
+        (
+            means2d,
+            conics,
+            colors,
+            opacities,
+            ray_planes,
+            Ks,
+            backgrounds,
+            masks,
+            isect_offsets,
+            flatten_ids,
+            render_alphas,
+            last_ids,
+            median_ids,
+            dist_accums,
+        ) = ctx.saved_tensors
+        width = ctx.width
+        height = ctx.height
+        tile_size = ctx.tile_size
+        absgrad = ctx.absgrad
+
+        (
+            v_means2d_abs,
+            v_means2d,
+            v_conics,
+            v_colors,
+            v_opacities,
+            v_ray_planes,
+        ) = _make_lazy_cuda_func("rasterize_to_pixels_3dgs_geom_bwd")(
+            means2d,
+            conics,
+            colors,
+            opacities,
+            ray_planes,
+            Ks,
+            ctx.distort_near,
+            ctx.distort_far,
+            backgrounds,
+            masks,
+            width,
+            height,
+            tile_size,
+            isect_offsets,
+            flatten_ids,
+            render_alphas,
+            last_ids,
+            median_ids,
+            dist_accums,
+            v_render_colors.contiguous(),
+            v_render_alphas.contiguous(),
+            v_render_edepths.contiguous(),
+            v_render_mdepths.contiguous(),
+            v_render_distorts.contiguous(),
+            absgrad,
+        )
+
+        if absgrad:
+            means2d.absgrad = v_means2d_abs
+
+        if ctx.needs_input_grad[6]:
+            v_backgrounds = (v_render_colors * (1.0 - render_alphas).float()).sum(
+                dim=(1, 2)
+            )
+        else:
+            v_backgrounds = None
+
+        return (
+            v_means2d,
+            v_conics,
+            v_colors,
+            v_opacities,
+            v_ray_planes,
+            None,  # Ks
+            v_backgrounds,
+            None,  # masks
+            None,  # width
+            None,  # height
+            None,  # tile_size
+            None,  # isect_offsets
+            None,  # flatten_ids
+            None,  # absgrad
+            None,  # distort_near
+            None,  # distort_far
+        )
+
+
+class _RasterizeToPixelsEval3DGeom(torch.autograd.Function):
+    """Rasterize gaussians with GOF eval3d geometry outputs."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        view2gaussians: Tensor,  # [C, N, 10]
+        means2d: Tensor,  # [C, N, 2]
+        conics: Tensor,  # [C, N, 3]
+        colors: Tensor,  # [C, N, D]
+        opacities: Tensor,  # [C, N]
+        Ks: Tensor,  # [C, 3, 3]
+        backgrounds: Tensor,  # [C, D], Optional
+        masks: Tensor,  # [C, tile_height, tile_width], Optional
+        width: int,
+        height: int,
+        tile_size: int,
+        isect_offsets: Tensor,  # [C, tile_height, tile_width]
+        flatten_ids: Tensor,  # [n_isects]
+        distort_near: float,
+        distort_far: float,
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+        (
+            render_colors,
+            render_alphas,
+            last_ids,
+            render_normals,
+            render_edepths,
+            render_mdepths,
+            median_ids,
+            render_distorts,
+            dist_accums,
+        ) = _make_lazy_cuda_func("rasterize_to_pixels_eval3d_geom_fwd")(
+            view2gaussians,
+            colors,
+            opacities,
+            Ks,
+            distort_near,
+            distort_far,
+            backgrounds,
+            masks,
+            width,
+            height,
+            tile_size,
+            isect_offsets,
+            flatten_ids,
+        )
+
+        ctx.save_for_backward(
+            view2gaussians,
+            means2d,
+            conics,
+            colors,
+            opacities,
+            Ks,
+            backgrounds,
+            masks,
+            isect_offsets,
+            flatten_ids,
+            render_alphas,
+            last_ids,
+            median_ids,
+            dist_accums,
+        )
+        ctx.width = width
+        ctx.height = height
+        ctx.tile_size = tile_size
+        ctx.distort_near = distort_near
+        ctx.distort_far = distort_far
+
+        render_alphas = render_alphas.float()
+        return (
+            render_colors,
+            render_alphas,
+            render_normals,
+            render_edepths,
+            render_mdepths,
+            render_distorts,
+        )
+
+    @staticmethod
+    def backward(
+        ctx,
+        v_render_colors: Tensor,  # [C, H, W, D]
+        v_render_alphas: Tensor,  # [C, H, W, 1]
+        v_render_normals: Tensor,  # [C, H, W, 3]
+        v_render_edepths: Tensor,  # [C, H, W, 1]
+        v_render_mdepths: Tensor,  # [C, H, W, 1]
+        v_render_distorts: Tensor,  # [C, H, W, 1]
+    ):
+        (
+            view2gaussians,
+            means2d,
+            conics,
+            colors,
+            opacities,
+            Ks,
+            backgrounds,
+            masks,
+            isect_offsets,
+            flatten_ids,
+            render_alphas,
+            last_ids,
+            median_ids,
+            dist_accums,
+        ) = ctx.saved_tensors
+        width = ctx.width
+        height = ctx.height
+        tile_size = ctx.tile_size
+
+        (
+            v_view2gaussians,
+            v_colors,
+            v_opacities,
+            v_means2d,
+            v_means2d_abs,
+        ) = _make_lazy_cuda_func("rasterize_to_pixels_eval3d_geom_bwd")(
+            view2gaussians,
+            means2d,
+            conics,
+            colors,
+            opacities,
+            Ks,
+            ctx.distort_near,
+            ctx.distort_far,
+            backgrounds,
+            masks,
+            width,
+            height,
+            tile_size,
+            isect_offsets,
+            flatten_ids,
+            render_alphas,
+            last_ids,
+            median_ids,
+            dist_accums,
+            v_render_colors.contiguous(),
+            v_render_alphas.contiguous(),
+            v_render_normals.contiguous(),
+            v_render_edepths.contiguous(),
+            v_render_mdepths.contiguous(),
+            v_render_distorts.contiguous(),
+        )
+
+        # GOF's densification signal: stashed as attributes, never returned
+        # as autograd gradients (GOF's preprocess backward ignores
+        # dL_dmean2D, so it must not leak into parameter gradients).
+        means2d.absgrad = v_means2d_abs
+        means2d.geomgrad = v_means2d
+
+        if ctx.needs_input_grad[6]:
+            v_backgrounds = (v_render_colors * (1.0 - render_alphas).float()).sum(
+                dim=(1, 2)
+            )
+        else:
+            v_backgrounds = None
+
+        return (
+            v_view2gaussians,
+            None,  # means2d: densification signal only, no autograd grad
+            None,  # conics: densification signal only, no autograd grad
+            v_colors,
+            v_opacities,
+            None,  # Ks
+            v_backgrounds,
+            None,  # masks
+            None,  # width
+            None,  # height
+            None,  # tile_size
+            None,  # isect_offsets
+            None,  # flatten_ids
+            None,  # distort_near
+            None,  # distort_far
+        )
 
 
 class _RasterizeToPixels(torch.autograd.Function):
@@ -3165,9 +3818,7 @@ class _RasterizeToPixelsTriangle(torch.autograd.Function):
             flatten_ids,
         )
         # Detached ids + densification stats — no gradient path.
-        ctx.mark_non_differentiable(
-            last_ids, median_ids, max_blending, pixel_count
-        )
+        ctx.mark_non_differentiable(last_ids, median_ids, max_blending, pixel_count)
         ctx.save_for_backward(
             proj_verts,
             edge_normals,

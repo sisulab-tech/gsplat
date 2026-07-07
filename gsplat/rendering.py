@@ -21,6 +21,8 @@ from .cuda._wrapper import (
     rasterize_to_pixels,
     rasterize_to_pixels_2dgs,
     rasterize_to_pixels_eval3d,
+    rasterize_to_pixels_eval3d_geom,
+    rasterize_to_pixels_geom,
     rasterize_to_pixels_triangle,
     spherical_harmonics,
     view_to_gaussians,
@@ -62,6 +64,9 @@ def rasterization(
     covars: Optional[Tensor] = None,
     with_ut: bool = False,
     with_eval3d: bool = False,
+    render_geometry: bool = False,
+    distort_near: float = 0.2,
+    distort_far: float = 100.0,
     # distortion
     radial_coeffs: Optional[Tensor] = None,
     tangential_coeffs: Optional[Tensor] = None,
@@ -320,25 +325,48 @@ def rasterization(
         or thin_prism_coeffs is not None
         or rolling_shutter != RollingShutterType.GLOBAL
     ):
-        assert (
-            with_ut
-        ), "Distortion and rolling shutter are only supported with `with_ut=True`."
+        assert with_ut, (
+            "Distortion and rolling shutter are only supported with `with_ut=True`."
+        )
 
     if rolling_shutter != RollingShutterType.GLOBAL:
-        assert (
-            viewmats_rs is not None
-        ), "Rolling shutter requires to provide viewmats_rs."
+        assert viewmats_rs is not None, (
+            "Rolling shutter requires to provide viewmats_rs."
+        )
     else:
-        assert (
-            viewmats_rs is None
-        ), "viewmats_rs should be None for global rolling shutter."
+        assert viewmats_rs is None, (
+            "viewmats_rs should be None for global rolling shutter."
+        )
 
     if with_ut or with_eval3d:
-        assert (quats is not None) and (
-            scales is not None
-        ), "UT and eval3d requires to provide quats and scales."
+        assert (quats is not None) and (scales is not None), (
+            "UT and eval3d requires to provide quats and scales."
+        )
         assert packed is False, "Packed mode is not supported with UT."
         assert sparse_grad is False, "Sparse grad is not supported with UT."
+
+    if render_geometry:
+        # RaDe-GS closed-form plane depth/normal outputs (arXiv:2406.01467).
+        assert covars is None and (quats is not None) and (scales is not None), (
+            "render_geometry requires quats and scales."
+        )
+        assert camera_model == "pinhole", (
+            "render_geometry only supports the pinhole camera model."
+        )
+        assert not with_ut, "render_geometry is not supported with UT rasterization."
+        if with_eval3d:
+            # the eval3d geometry kernel builds camera-space pixel rays from
+            # Ks only (GOF parity): no lens distortion / rolling shutter.
+            assert (
+                radial_coeffs is None
+                and tangential_coeffs is None
+                and thin_prism_coeffs is None
+            ), "render_geometry with eval3d does not support lens distortion."
+            assert rolling_shutter == RollingShutterType.GLOBAL, (
+                "render_geometry with eval3d does not support rolling shutter."
+            )
+        assert not distributed, "render_geometry is not supported in distributed mode."
+        assert not sparse_grad, "render_geometry is not supported with sparse_grad."
 
     # Implement the multi-GPU strategy proposed in
     # `On Scaling Up 3D Gaussian Splatting Training <https://arxiv.org/abs/2406.18533>`.
@@ -623,7 +651,137 @@ def rasterization(
     )
 
     # print("rank", world_rank, "Before rasterize_to_pixels")
-    if colors.shape[-1] > channel_chunk:
+    if render_geometry and with_eval3d:
+        from .cuda._torch_impl_radegs import compute_view2gaussians
+
+        assert colors.shape[-1] <= channel_chunk, (
+            "render_geometry does not support channel chunking; reduce the "
+            "number of color channels."
+        )
+        # Algebraic inverse of the world-to-camera transform (what the
+        # view_to_gaussians CUDA op expects; avoids torch.linalg.inv
+        # numerics).
+        R_cw = viewmats[:, :3, :3]
+        t_cw = viewmats[:, :3, 3]
+        camtoworlds = torch.zeros_like(viewmats)
+        camtoworlds[:, :3, :3] = R_cw.transpose(-1, -2)
+        camtoworlds[:, :3, 3] = -torch.einsum("cji,cj->ci", R_cw, t_cw)
+        camtoworlds[:, 3, 3] = 1.0
+        # differentiable torch preprocess (GOF's computeView2Gaussian);
+        # the rasterize op emits dL/dview2gaussians and autograd chains
+        # to means/quats/scales, exactly GOF's backward split.
+        view2gaussians = compute_view2gaussians(means, quats, scales, camtoworlds)
+        (
+            render_colors,
+            render_alphas,
+            render_normals,
+            render_edepths,
+            render_mdepths,
+            render_distorts,
+        ) = rasterize_to_pixels_eval3d_geom(
+            view2gaussians,
+            means2d,
+            conics,
+            colors,
+            opacities,
+            Ks,
+            width,
+            height,
+            tile_size,
+            isect_offsets,
+            flatten_ids,
+            backgrounds=backgrounds,
+            distort_near=distort_near,
+            distort_far=distort_far,
+        )
+        meta.update(
+            {
+                # accumulated camera-space normals (unnormalized)
+                "render_normals": render_normals,
+                # alpha-normalized expected depth (z-depth)
+                "expected_depths": render_edepths / render_alphas.clamp(min=1e-10),
+                # raw alpha-weighted accumulation
+                "accum_depths": render_edepths,
+                # median depth (z-depth)
+                "median_depths": render_mdepths,
+                # GOF-normalized distortion map
+                "render_distorts": render_distorts / (render_alphas**2 + 1e-7),
+                "view2gaussians": view2gaussians,
+            }
+        )
+    elif render_geometry:
+        from .cuda._torch_impl_radegs import compute_ray_planes
+
+        assert colors.shape[-1] + 3 <= channel_chunk, (
+            "render_geometry does not support channel chunking; reduce the "
+            "number of color channels."
+        )
+        ray_planes, normals_g = compute_ray_planes(
+            means,
+            quats,
+            scales,
+            viewmats,
+            Ks,
+            width,
+            height,
+            near_plane=near_plane,
+        )  # [C, N, 3] each
+        if packed:
+            ray_planes = ray_planes[camera_ids, gaussian_ids]
+            normals_g = normals_g[camera_ids, gaussian_ids]
+        D = colors.shape[-1]
+        # normals blend exactly like color channels
+        colors_geom = torch.cat([colors, normals_g], dim=-1)
+        backgrounds_geom = (
+            torch.cat(
+                [backgrounds, torch.zeros(C, 3, device=backgrounds.device)], dim=-1
+            )
+            if backgrounds is not None
+            else None
+        )
+        (
+            render_colors,
+            render_alphas,
+            render_edepths,
+            render_mdepths,
+            render_distorts,
+        ) = rasterize_to_pixels_geom(
+            means2d,
+            conics,
+            colors_geom,
+            opacities,
+            ray_planes,
+            Ks,
+            width,
+            height,
+            tile_size,
+            isect_offsets,
+            flatten_ids,
+            backgrounds=backgrounds_geom,
+            packed=packed,
+            absgrad=absgrad,
+            distort_near=distort_near,
+            distort_far=distort_far,
+        )
+        render_normals = render_colors[..., D : D + 3]
+        render_colors = render_colors[..., :D]
+        meta.update(
+            {
+                # accumulated camera-space normals (unnormalized)
+                "render_normals": render_normals,
+                # alpha-normalized expected plane depth (z-depth; RaDe-GS
+                # out_depth convention)
+                "expected_depths": render_edepths / render_alphas.clamp(min=1e-10),
+                # raw alpha-weighted accumulation (RaDe-GS accum_depth)
+                "accum_depths": render_edepths,
+                # median plane depth (z-depth)
+                "median_depths": render_mdepths,
+                # GOF-normalized distortion map
+                "render_distorts": render_distorts / (render_alphas**2 + 1e-7),
+                "ray_planes": ray_planes,
+            }
+        )
+    elif colors.shape[-1] > channel_chunk:
         # slice into chunks
         n_chunks = (colors.shape[-1] + channel_chunk - 1) // channel_chunk
         render_colors, render_alphas = [], []

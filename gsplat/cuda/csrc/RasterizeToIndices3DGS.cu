@@ -14,6 +14,7 @@ template <typename scalar_t>
 __global__ void rasterize_to_indices_3dgs_kernel(
     const uint32_t range_start,
     const uint32_t range_end,
+    const float visibility_threshold,
     const uint32_t C,
     const uint32_t N,
     const uint32_t n_isects,
@@ -150,6 +151,18 @@ __global__ void rasterize_to_indices_3dgs_kernel(
                 break;
             }
 
+            // PGSR-style observe gate: count a gaussian as contributing only
+            // while the pre-composite transmittance exceeds the threshold
+            // (T > 0.5 in PGSR's out_observe). `trans` is monotonically
+            // decreasing, so once it drops to/below the threshold no later
+            // gaussian in this pixel can qualify -> stop this pixel. With the
+            // default threshold 0.0 this is a no-op (trans is always > 0 here),
+            // preserving the original all-contributors behaviour.
+            if (trans <= visibility_threshold) {
+                done = true;
+                break;
+            }
+
             if (first_pass) {
                 // First pass of this function we count the number of gaussians
                 // that contribute to each pixel
@@ -175,7 +188,8 @@ __global__ void rasterize_to_indices_3dgs_kernel(
 
 void launch_rasterize_to_indices_3dgs_kernel(
     const uint32_t range_start,
-    const uint32_t range_end,        // iteration steps
+    const uint32_t range_end,          // iteration steps
+    const float visibility_threshold,  // observe gate: T>threshold (0 = off)
     const at::Tensor transmittances, // [C, image_height, image_width]
     // Gaussian parameters
     const at::Tensor means2d,   // [C, N, 2]
@@ -229,6 +243,7 @@ void launch_rasterize_to_indices_3dgs_kernel(
         <<<grid, threads, shmem_size, at::cuda::getCurrentCUDAStream()>>>(
             range_start,
             range_end,
+            visibility_threshold,
             C,
             N,
             n_isects,

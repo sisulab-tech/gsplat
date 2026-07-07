@@ -259,10 +259,151 @@ rasterize_to_pixels_3dgs_bwd(
     bool absgrad
 );
 
+// Rasterize 3D Gaussians to pixels with RaDe-GS geometry outputs
+// (expected/median plane depth, GOF distortion). Returns
+// (renders, alphas, last_ids, render_edepths, render_mdepths, median_ids,
+//  render_distorts, dist_accums).
+std::tuple<
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor>
+rasterize_to_pixels_3dgs_geom_fwd(
+    // Gaussian parameters
+    const at::Tensor means2d,    // [C, N, 2] or [nnz, 2]
+    const at::Tensor conics,     // [C, N, 3] or [nnz, 3]
+    const at::Tensor colors,     // [C, N, channels] or [nnz, channels]
+    const at::Tensor opacities,  // [C, N]  or [nnz]
+    const at::Tensor ray_planes, // [C, N, 3] or [nnz, 3]
+    const at::Tensor Ks,         // [C, 3, 3]
+    const double distort_near,
+    const double distort_far,
+    const at::optional<at::Tensor> backgrounds, // [C, channels]
+    const at::optional<at::Tensor> masks,       // [C, tile_height, tile_width]
+    // image size
+    const uint32_t image_width,
+    const uint32_t image_height,
+    const uint32_t tile_size,
+    // intersections
+    const at::Tensor tile_offsets, // [C, tile_height, tile_width]
+    const at::Tensor flatten_ids   // [n_isects]
+);
+// Returns (v_means2d_abs, v_means2d, v_conics, v_colors, v_opacities,
+// v_ray_planes).
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+rasterize_to_pixels_3dgs_geom_bwd(
+    // Gaussian parameters
+    const at::Tensor means2d,    // [C, N, 2] or [nnz, 2]
+    const at::Tensor conics,     // [C, N, 3] or [nnz, 3]
+    const at::Tensor colors,     // [C, N, CDIM] or [nnz, CDIM]
+    const at::Tensor opacities,  // [C, N] or [nnz]
+    const at::Tensor ray_planes, // [C, N, 3] or [nnz, 3]
+    const at::Tensor Ks,         // [C, 3, 3]
+    const double distort_near,
+    const double distort_far,
+    const at::optional<at::Tensor> backgrounds, // [C, CDIM]
+    const at::optional<at::Tensor> masks,       // [C, tile_height, tile_width]
+    // image size
+    const uint32_t image_width,
+    const uint32_t image_height,
+    const uint32_t tile_size,
+    // intersections
+    const at::Tensor tile_offsets, // [C, tile_height, tile_width]
+    const at::Tensor flatten_ids,  // [n_isects]
+    // forward outputs
+    const at::Tensor render_alphas, // [C, image_height, image_width, 1]
+    const at::Tensor last_ids,      // [C, image_height, image_width]
+    const at::Tensor median_ids,    // [C, image_height, image_width]
+    const at::Tensor dist_accums,   // [C, image_height, image_width, 2]
+    // gradients of outputs
+    const at::Tensor v_render_colors,   // [C, image_height, image_width, CDIM]
+    const at::Tensor v_render_alphas,   // [C, image_height, image_width, 1]
+    const at::Tensor v_render_edepths,  // [C, image_height, image_width, 1]
+    const at::Tensor v_render_mdepths,  // [C, image_height, image_width, 1]
+    const at::Tensor v_render_distorts, // [C, image_height, image_width, 1]
+    // options
+    bool absgrad
+);
+
+// Rasterize 3D Gaussians to pixels with GOF eval3d geometry outputs:
+// color/alpha/normal/expected/median depth/distortion composited with the
+// peak 3D response along camera-space pixel rays (view2gaussians quadric).
+// Returns (renders, alphas, last_ids, render_normals, render_edepths,
+// render_mdepths, median_ids, render_distorts, dist_accums).
+std::tuple<
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor>
+rasterize_to_pixels_eval3d_geom_fwd(
+    // Gaussian parameters
+    const at::Tensor view2gaussians, // [C, N, 10]
+    const at::Tensor colors,         // [C, N, channels]
+    const at::Tensor opacities,      // [C, N]
+    const at::Tensor Ks,             // [C, 3, 3]
+    const double distort_near,
+    const double distort_far,
+    const at::optional<at::Tensor> backgrounds, // [C, channels]
+    const at::optional<at::Tensor> masks,       // [C, tile_height, tile_width]
+    // image size
+    const uint32_t image_width,
+    const uint32_t image_height,
+    const uint32_t tile_size,
+    // intersections
+    const at::Tensor tile_offsets, // [C, tile_height, tile_width]
+    const at::Tensor flatten_ids   // [n_isects]
+);
+// Returns (v_view2gaussians, v_colors, v_opacities, v_means2d,
+// v_means2d_abs). v_means2d / v_means2d_abs are GOF's conic-based
+// densification signal only, never chained into parameter gradients.
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+rasterize_to_pixels_eval3d_geom_bwd(
+    // Gaussian parameters
+    const at::Tensor view2gaussians, // [C, N, 10]
+    const at::Tensor means2d,        // [C, N, 2]
+    const at::Tensor conics,         // [C, N, 3]
+    const at::Tensor colors,         // [C, N, CDIM]
+    const at::Tensor opacities,      // [C, N]
+    const at::Tensor Ks,             // [C, 3, 3]
+    const double distort_near,
+    const double distort_far,
+    const at::optional<at::Tensor> backgrounds, // [C, CDIM]
+    const at::optional<at::Tensor> masks,       // [C, tile_height, tile_width]
+    // image size
+    const uint32_t image_width,
+    const uint32_t image_height,
+    const uint32_t tile_size,
+    // intersections
+    const at::Tensor tile_offsets, // [C, tile_height, tile_width]
+    const at::Tensor flatten_ids,  // [n_isects]
+    // forward outputs
+    const at::Tensor render_alphas, // [C, image_height, image_width, 1]
+    const at::Tensor last_ids,      // [C, image_height, image_width]
+    const at::Tensor median_ids,    // [C, image_height, image_width]
+    const at::Tensor dist_accums,   // [C, image_height, image_width, 2]
+    // gradients of outputs
+    const at::Tensor v_render_colors,  // [C, image_height, image_width, CDIM]
+    const at::Tensor v_render_alphas,  // [C, image_height, image_width, 1]
+    const at::Tensor v_render_normals, // [C, image_height, image_width, 3]
+    const at::Tensor v_render_edepths, // [C, image_height, image_width, 1]
+    const at::Tensor v_render_mdepths, // [C, image_height, image_width, 1]
+    const at::Tensor v_render_distorts // [C, image_height, image_width, 1]
+);
+
 // Rasterize 3D Gaussian, but only return the indices of gaussians and pixels.
 std::tuple<at::Tensor, at::Tensor> rasterize_to_indices_3dgs(
     const uint32_t range_start,
-    const uint32_t range_end,        // iteration steps
+    const uint32_t range_end,          // iteration steps
+    const float visibility_threshold,  // observe gate: T>threshold (0 = off)
     const at::Tensor transmittances, // [C, image_height, image_width]
     // Gaussian parameters
     const at::Tensor means2d,   // [C, N, 2]
