@@ -520,8 +520,10 @@ def export_splats(
         | torch.isinf(scales).any(dim=1)
         | torch.isnan(quats).any(dim=1)
         | torch.isinf(quats).any(dim=1)
-        | torch.isnan(opacities).any(dim=0)
-        | torch.isinf(opacities).any(dim=0)
+        # opacities is 1-D; .any(dim=0) would collapse to a scalar and flag
+        # every splat invalid as soon as a single opacity is NaN/Inf
+        | torch.isnan(opacities)
+        | torch.isinf(opacities)
         | torch.isnan(sh0).any(dim=1)
         | torch.isinf(sh0).any(dim=1)
         | torch.isnan(shN).any(dim=1)
