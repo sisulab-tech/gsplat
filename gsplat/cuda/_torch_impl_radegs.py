@@ -96,24 +96,26 @@ def compute_ray_planes(
     # so Sigma_cam^{-1} = A A^T with A = R_cam_gauss S^{-1}. When the smallest
     # scale is degenerate the reference falls back to the rank-1 outer product
     # of the thinnest axis (unit magnitude, S dropped): the Gaussian is treated
-    # as a plane orthogonal to that axis.
+    # as a plane orthogonal to that axis. Sigma^{-1} is only ever applied to
+    # one vector (``uvh`` below), so it is never materialized: the product is
+    # expressed through the columns of R_cg, because cuBLAS batched gemms over
+    # C*N tiny 3x3 matrices dominate this function's GPU time.
     R_g = _quat_to_rotmat(F.normalize(quats, dim=-1))  # [N, 3, 3]
-    R_cg = torch.einsum("cij,njk->cnik", R_cw, R_g)  # [C, N, 3, 3]
+    # R_cg = R_cw @ R_g as C flat [3, 3] @ [3, N*3] gemms, not per-N batches.
+    R_cg = (
+        (R_cw @ R_g.permute(1, 0, 2).reshape(3, N * 3))
+        .reshape(C, 3, N, 3)
+        .permute(0, 2, 1, 3)
+    )  # [C, N, 3, 3]
+    col0, col1, col2 = R_cg.unbind(dim=-1)  # [C, N, 3] camera-space axes
 
     well_conditioned = scales.amin(dim=-1) > min_scale  # [N]
     safe_scales = scales.clamp_min(min_scale)
-    A = R_cg / safe_scales[None, :, None, :]  # [C, N, 3, 3] columns scaled
-    cov_inv_full = A @ A.transpose(-1, -2)  # [C, N, 3, 3]
 
-    min_axis_id = scales.argmin(dim=-1)  # [N]
-    min_axis = torch.gather(
-        R_cg, 3, min_axis_id[None, :, None, None].expand(C, N, 3, 1)
-    ).squeeze(-1)  # [C, N, 3] camera-space thinnest axis
-    cov_inv_rank1 = min_axis[..., :, None] * min_axis[..., None, :]  # [C, N, 3, 3]
-
-    cov_inv = torch.where(
-        well_conditioned[None, :, None, None], cov_inv_full, cov_inv_rank1
-    )
+    min_axis_id = scales.argmin(dim=-1)[None, :, None]  # [1, N, 1]
+    min_axis = torch.where(
+        min_axis_id == 0, col0, torch.where(min_axis_id == 1, col1, col2)
+    )  # [C, N, 3] camera-space thinnest axis
 
     # Reference clamps the view-space point used for the linearization to
     # 1.3x the frustum (same clamp EWA uses for the projection Jacobian).
@@ -144,7 +146,20 @@ def compute_ray_planes(
     l = torch.sqrt(tx * tx + ty * ty + tz * tz)  # clamped distance
 
     uvh = torch.stack([u, v, torch.ones_like(u)], dim=-1)  # [C, N, 3]
-    uvh_m = torch.einsum("cnij,cnj->cni", cov_inv, uvh)  # [C, N, 3]
+    # Sigma^{-1} uvh = sum_k col_k (col_k . uvh) / s_k^2; the rank-1 fallback
+    # is the min-axis term alone with S dropped. Component form keeps every op
+    # elementwise on [C, N, 3] (no batched-3x3 matvec), and the degenerate
+    # select happens on the vector, not a [C, N, 3, 3] matrix.
+    inv_s2 = 1.0 / (safe_scales * safe_scales)  # [N, 3]
+    uvh_m_full = (
+        col0 * ((col0 * uvh).sum(dim=-1) * inv_s2[None, :, 0])[..., None]
+        + col1 * ((col1 * uvh).sum(dim=-1) * inv_s2[None, :, 1])[..., None]
+        + col2 * ((col2 * uvh).sum(dim=-1) * inv_s2[None, :, 2])[..., None]
+    )
+    uvh_m_rank1 = min_axis * (min_axis * uvh).sum(dim=-1, keepdim=True)
+    uvh_m = torch.where(
+        well_conditioned[None, :, None], uvh_m_full, uvh_m_rank1
+    )  # [C, N, 3]
     uvh_m_norm = torch.linalg.norm(uvh_m, dim=-1, keepdim=True)
     # Degenerate: Sigma^{-1} r == 0 (reference emits rp=0, normal=(0,0,-1)),
     # plus the near-plane-culled lanes masked above.
