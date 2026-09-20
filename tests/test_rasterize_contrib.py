@@ -249,16 +249,32 @@ def _run(scene, **kwargs):
     from gsplat.cuda._wrapper import rasterize_to_pixels_contrib
 
     return rasterize_to_pixels_contrib(
-        scene["means2d"],
-        scene["conics"],
-        scene["colors"],
-        scene["opacities"],
-        scene["depths"],
-        scene["width"],
-        scene["height"],
-        scene["tile_size"],
-        scene["isect_offsets"],
-        scene["flatten_ids"],
+        means2d=scene["means2d"],
+        conics=scene["conics"],
+        colors=scene["colors"],
+        opacities=scene["opacities"],
+        depths=scene["depths"],
+        image_width=scene["width"],
+        image_height=scene["height"],
+        tile_size=scene["tile_size"],
+        isect_offsets=scene["isect_offsets"],
+        flatten_ids=scene["flatten_ids"],
+        **kwargs,
+    )
+
+
+def _ref(scene, **kwargs):
+    return _reference(
+        means2d=scene["means2d"],
+        conics=scene["conics"],
+        colors=scene["colors"],
+        opacities=scene["opacities"],
+        depths=scene["depths"],
+        image_width=scene["width"],
+        image_height=scene["height"],
+        tile_size=scene["tile_size"],
+        isect_offsets=scene["isect_offsets"],
+        flatten_ids=scene["flatten_ids"],
         **kwargs,
     )
 
@@ -278,20 +294,7 @@ def test_matches_reference():
         ref_max_pixel,
         ref_min_sd,
         unique,
-    ) = _reference(
-        scene["means2d"],
-        scene["conics"],
-        scene["colors"],
-        scene["opacities"],
-        scene["depths"],
-        scene["width"],
-        scene["height"],
-        scene["tile_size"],
-        scene["isect_offsets"],
-        scene["flatten_ids"],
-        backgrounds=backgrounds,
-        calculate_surface_distance=True,
-    )
+    ) = _ref(scene, backgrounds=backgrounds, calculate_surface_distance=True)
 
     torch.testing.assert_close(colors, ref_colors, atol=1e-4, rtol=1e-4)
     torch.testing.assert_close(edepth, ref_edepth, atol=1e-4, rtol=1e-4)
@@ -304,6 +307,38 @@ def test_matches_reference():
     # every tile here holds fewer than one batch, so the surface distance is
     # taken against the fully accumulated depth
     assert (min_sd < FLOAT_MAX).any()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="No CUDA device")
+def test_ragged_image_size():
+    # 70x50 leaves partial tiles on both edges, so the padding threads of those
+    # tiles must not contribute to the surface distances
+    scene = _scene(n_gauss=300, width=70, height=50, seed=5)
+    assert scene["width"] % scene["tile_size"] != 0
+    assert scene["height"] % scene["tile_size"] != 0
+
+    colors, edepth, max_contrib, max_pixel, min_sd = _run(
+        scene, calculate_surface_distance=True
+    )
+    (
+        ref_colors,
+        ref_edepth,
+        ref_max_contrib,
+        ref_max_pixel,
+        ref_min_sd,
+        unique,
+    ) = _ref(scene, calculate_surface_distance=True)
+
+    torch.testing.assert_close(colors, ref_colors, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(edepth, ref_edepth, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(max_contrib, ref_max_contrib, atol=1e-5, rtol=1e-4)
+    torch.testing.assert_close(min_sd, ref_min_sd, atol=1e-4, rtol=1e-4)
+
+    assert unique.any()
+    assert torch.equal(max_pixel[unique], ref_max_pixel[unique])
+    # a winning pixel is always a real pixel of the image
+    voted = max_contrib > 0
+    assert torch.all(max_pixel[voted] < scene["width"] * scene["height"])
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="No CUDA device")
@@ -321,19 +356,7 @@ def test_multi_batch_surface_distance():
         ref_max_pixel,
         ref_min_sd,
         unique,
-    ) = _reference(
-        scene["means2d"],
-        scene["conics"],
-        scene["colors"],
-        scene["opacities"],
-        scene["depths"],
-        scene["width"],
-        scene["height"],
-        scene["tile_size"],
-        scene["isect_offsets"],
-        scene["flatten_ids"],
-        calculate_surface_distance=True,
-    )
+    ) = _ref(scene, calculate_surface_distance=True)
 
     torch.testing.assert_close(max_contrib, ref_max_contrib, atol=1e-5, rtol=1e-4)
     torch.testing.assert_close(min_sd, ref_min_sd, atol=1e-4, rtol=1e-4)
@@ -363,19 +386,7 @@ def test_masked_pixels_cast_no_votes():
         ref_max_pixel,
         _,
         unique,
-    ) = _reference(
-        scene["means2d"],
-        scene["conics"],
-        scene["colors"],
-        scene["opacities"],
-        scene["depths"],
-        scene["width"],
-        scene["height"],
-        scene["tile_size"],
-        scene["isect_offsets"],
-        scene["flatten_ids"],
-        pixel_masks=masks,
-    )
+    ) = _ref(scene, pixel_masks=masks)
     torch.testing.assert_close(colors, ref_colors, atol=1e-4, rtol=1e-4)
     torch.testing.assert_close(edepth, ref_edepth, atol=1e-4, rtol=1e-4)
     torch.testing.assert_close(max_contrib, ref_max_contrib, atol=1e-5, rtol=1e-4)
