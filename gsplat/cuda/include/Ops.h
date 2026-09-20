@@ -259,6 +259,31 @@ rasterize_to_pixels_3dgs_bwd(
     bool absgrad
 );
 
+// Rasterize 3D Gaussians to pixels while recording, per Gaussian and per
+// view, its maximum contribution (alpha * T) to a pixel, the id of that pixel,
+// and optionally its minimum distance to the accumulated depth (3DGS-to-PC).
+// Returns (renders, expected_depths, max_contrib, max_pixel,
+//  min_surface_dist).
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+rasterize_to_pixels_3dgs_contrib_fwd(
+    // Gaussian parameters
+    const at::Tensor means2d,   // [C, N, 2]
+    const at::Tensor conics,    // [C, N, 3]
+    const at::Tensor colors,    // [C, N, channels]
+    const at::Tensor opacities, // [C, N]
+    const at::Tensor depths,    // [C, N]
+    const at::optional<at::Tensor> backgrounds, // [C, channels]
+    const at::optional<at::Tensor> pixel_masks, // [C, image_height, image_width]
+    // image size
+    const uint32_t image_width,
+    const uint32_t image_height,
+    const uint32_t tile_size,
+    // intersections
+    const at::Tensor tile_offsets, // [C, tile_height, tile_width]
+    const at::Tensor flatten_ids,  // [n_isects]
+    const bool calculate_surface_distance
+);
+
 // Rasterize 3D Gaussians to pixels with RaDe-GS geometry outputs
 // (expected/median plane depth, GOF distortion). Returns
 // (renders, alphas, last_ids, render_edepths, render_mdepths, median_ids,

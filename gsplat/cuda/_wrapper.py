@@ -616,6 +616,129 @@ def rasterize_to_pixels(
     return render_colors, render_alphas
 
 
+def rasterize_to_pixels_contrib(
+    means2d: Tensor,  # [C, N, 2]
+    conics: Tensor,  # [C, N, 3]
+    colors: Tensor,  # [C, N, channels]
+    opacities: Tensor,  # [C, N]
+    depths: Tensor,  # [C, N]
+    image_width: int,
+    image_height: int,
+    tile_size: int,
+    isect_offsets: Tensor,  # [C, tile_height, tile_width]
+    flatten_ids: Tensor,  # [n_isects]
+    backgrounds: Optional[Tensor] = None,  # [C, channels]
+    pixel_masks: Optional[Tensor] = None,  # [C, image_height, image_width]
+    calculate_surface_distance: bool = False,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """Rasterizes Gaussians to pixels and records their per-view contributions.
+
+    Forward only, for point-cloud export (3DGS-to-PC). The blending constants
+    differ from :func:`rasterize_to_pixels`: alpha is capped at 0.99 and a
+    pixel stops once its transmittance would drop below 1e-4.
+
+    Args:
+        means2d: Projected Gaussian means. [C, N, 2]
+        conics: Inverse of the projected covariances with only upper triangle values. [C, N, 3]
+        colors: Gaussian colors or ND features. [C, N, channels]
+        opacities: Gaussian opacities that support per-view values. [C, N]
+        depths: Camera-space depth of each Gaussian. [C, N]
+        image_width: Image width.
+        image_height: Image height.
+        tile_size: Tile size.
+        isect_offsets: Intersection offsets outputs from `isect_offset_encode()`. [C, tile_height, tile_width]
+        flatten_ids: The global flatten indices in [C * N] from `isect_tiles()`. [n_isects]
+        backgrounds: Background colors. [C, channels]. Default: None.
+        pixel_masks: Pixels that are False neither render nor vote. [C, image_height, image_width]. Default: None.
+        calculate_surface_distance: Whether to fill `min_surface_dist`. Default: False.
+
+    Returns:
+        A tuple:
+
+        - **Rendered colors**. [C, image_height, image_width, channels]
+        - **Expected depths**, un-normalized sum of z * alpha * T. [C, image_height, image_width]
+        - **Max contribution** of each Gaussian to any pixel. [C, N]
+        - **Pixel id** of that maximum, flattened row-major, 0 when unseen. [C, N]
+        - **Min surface distance**, float32 max where unset. [C, N]
+    """
+
+    C = isect_offsets.size(0)
+    device = means2d.device
+    N = means2d.size(1)
+    assert means2d.shape == (C, N, 2), means2d.shape
+    assert conics.shape == (C, N, 3), conics.shape
+    assert colors.shape[:2] == (C, N), colors.shape
+    assert opacities.shape == (C, N), opacities.shape
+    assert depths.shape == (C, N), depths.shape
+    if backgrounds is not None:
+        assert backgrounds.shape == (C, colors.shape[-1]), backgrounds.shape
+        backgrounds = backgrounds.contiguous()
+    if pixel_masks is not None:
+        assert pixel_masks.shape == (C, image_height, image_width), pixel_masks.shape
+        pixel_masks = pixel_masks.contiguous()
+
+    # Pad the channels to the nearest supported number if necessary
+    channels = colors.shape[-1]
+    supported = (1, 2, 3, 4, 5, 8, 9, 16, 17, 32, 33)
+    if channels > 33 or channels == 0:
+        raise ValueError(f"Unsupported number of color channels: {channels}")
+    if channels not in supported:
+        padded_channels = (1 << (channels - 1).bit_length()) - channels
+        colors = torch.cat(
+            [
+                colors,
+                torch.zeros(*colors.shape[:-1], padded_channels, device=device),
+            ],
+            dim=-1,
+        )
+        if backgrounds is not None:
+            backgrounds = torch.cat(
+                [
+                    backgrounds,
+                    torch.zeros(
+                        *backgrounds.shape[:-1], padded_channels, device=device
+                    ),
+                ],
+                dim=-1,
+            )
+    else:
+        padded_channels = 0
+
+    tile_height, tile_width = isect_offsets.shape[1:3]
+    assert tile_height * tile_size >= image_height, (
+        f"Assert Failed: {tile_height} * {tile_size} >= {image_height}"
+    )
+    assert tile_width * tile_size >= image_width, (
+        f"Assert Failed: {tile_width} * {tile_size} >= {image_width}"
+    )
+
+    (
+        render_colors,
+        expected_depths,
+        max_contrib,
+        max_pixel,
+        min_surface_dist,
+    ) = _make_lazy_cuda_func("rasterize_to_pixels_3dgs_contrib_fwd")(
+        means2d.contiguous(),
+        conics.contiguous(),
+        colors.contiguous(),
+        opacities.contiguous(),
+        depths.contiguous(),
+        backgrounds,
+        pixel_masks,
+        image_width,
+        image_height,
+        tile_size,
+        isect_offsets.contiguous(),
+        flatten_ids.contiguous(),
+        calculate_surface_distance,
+    )
+
+    if padded_channels > 0:
+        render_colors = render_colors[..., :-padded_channels]
+    return render_colors, expected_depths, max_contrib, max_pixel, min_surface_dist
+
+
 def rasterize_to_pixels_geom(
     means2d: Tensor,  # [C, N, 2] or [nnz, 2]
     conics: Tensor,  # [C, N, 3] or [nnz, 3]

@@ -1,6 +1,7 @@
 #include <ATen/TensorUtils.h>
 #include <ATen/core/Tensor.h>
 #include <c10/cuda/CUDAGuard.h> // for DEVICE_GUARD
+#include <limits>
 #include <tuple>
 
 #include <ATen/Functions.h>
@@ -107,6 +108,105 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> rasterize_to_pixels_3dgs_fwd(
 #undef __LAUNCH_KERNEL__
 
     return std::make_tuple(renders, alphas, last_ids);
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+rasterize_to_pixels_3dgs_contrib_fwd(
+    // Gaussian parameters
+    const at::Tensor means2d,   // [C, N, 2]
+    const at::Tensor conics,    // [C, N, 3]
+    const at::Tensor colors,    // [C, N, channels]
+    const at::Tensor opacities, // [C, N]
+    const at::Tensor depths,    // [C, N]
+    const at::optional<at::Tensor> backgrounds, // [C, channels]
+    const at::optional<at::Tensor> pixel_masks, // [C, image_height, image_width]
+    // image size
+    const uint32_t image_width,
+    const uint32_t image_height,
+    const uint32_t tile_size,
+    // intersections
+    const at::Tensor tile_offsets, // [C, tile_height, tile_width]
+    const at::Tensor flatten_ids,  // [n_isects]
+    const bool calculate_surface_distance
+) {
+    DEVICE_GUARD(means2d);
+    CHECK_INPUT(means2d);
+    CHECK_INPUT(conics);
+    CHECK_INPUT(colors);
+    CHECK_INPUT(opacities);
+    CHECK_INPUT(depths);
+    CHECK_INPUT(tile_offsets);
+    CHECK_INPUT(flatten_ids);
+    if (backgrounds.has_value()) {
+        CHECK_INPUT(backgrounds.value());
+    }
+    if (pixel_masks.has_value()) {
+        CHECK_INPUT(pixel_masks.value());
+    }
+    TORCH_CHECK(means2d.dim() == 3, "packed inputs are not supported");
+
+    uint32_t C = tile_offsets.size(0); // number of cameras
+    uint32_t N = means2d.size(1);      // number of gaussians
+    uint32_t channels = colors.size(-1);
+
+    at::Tensor renders =
+        at::empty({C, image_height, image_width, channels}, means2d.options());
+    at::Tensor expected_depths =
+        at::empty({C, image_height, image_width}, means2d.options());
+    at::Tensor max_contrib = at::zeros({C, N}, means2d.options());
+    at::Tensor max_pixel =
+        at::zeros({C, N}, means2d.options().dtype(at::kInt));
+    at::Tensor min_surface_dist = at::full(
+        {C, N}, std::numeric_limits<float>::max(), means2d.options()
+    );
+    at::Tensor max_contrib_packed =
+        at::zeros({C, N}, means2d.options().dtype(at::kLong));
+
+#define __LAUNCH_KERNEL__(N)                                                   \
+    case N:                                                                    \
+        launch_rasterize_to_pixels_3dgs_contrib_fwd_kernel<N>(                 \
+            means2d,                                                           \
+            conics,                                                            \
+            colors,                                                            \
+            opacities,                                                         \
+            depths,                                                            \
+            backgrounds,                                                       \
+            pixel_masks,                                                       \
+            image_width,                                                       \
+            image_height,                                                      \
+            tile_size,                                                         \
+            tile_offsets,                                                      \
+            flatten_ids,                                                       \
+            calculate_surface_distance,                                        \
+            max_contrib_packed,                                                \
+            renders,                                                           \
+            expected_depths,                                                   \
+            max_contrib,                                                       \
+            max_pixel,                                                         \
+            min_surface_dist                                                   \
+        );                                                                     \
+        break;
+
+    switch (channels) {
+        __LAUNCH_KERNEL__(1)
+        __LAUNCH_KERNEL__(2)
+        __LAUNCH_KERNEL__(3)
+        __LAUNCH_KERNEL__(4)
+        __LAUNCH_KERNEL__(5)
+        __LAUNCH_KERNEL__(8)
+        __LAUNCH_KERNEL__(9)
+        __LAUNCH_KERNEL__(16)
+        __LAUNCH_KERNEL__(17)
+        __LAUNCH_KERNEL__(32)
+        __LAUNCH_KERNEL__(33)
+    default:
+        AT_ERROR("Unsupported number of channels: ", channels);
+    }
+#undef __LAUNCH_KERNEL__
+
+    return std::make_tuple(
+        renders, expected_depths, max_contrib, max_pixel, min_surface_dist
+    );
 }
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>

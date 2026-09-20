@@ -68,6 +68,38 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernel(
 );
 
 /////////////////////////////////////////////////
+// rasterize_to_pixels_3dgs_contrib (3DGS-to-PC contribution outputs)
+/////////////////////////////////////////////////
+
+template <uint32_t CDIM>
+void launch_rasterize_to_pixels_3dgs_contrib_fwd_kernel(
+    // Gaussian parameters
+    const at::Tensor means2d,   // [C, N, 2]
+    const at::Tensor conics,    // [C, N, 3]
+    const at::Tensor colors,    // [C, N, channels]
+    const at::Tensor opacities, // [C, N]
+    const at::Tensor depths,    // [C, N]
+    const at::optional<at::Tensor> backgrounds, // [C, channels]
+    const at::optional<at::Tensor> pixel_masks, // [C, image_height, image_width]
+    // image size
+    const uint32_t image_width,
+    const uint32_t image_height,
+    const uint32_t tile_size,
+    // intersections
+    const at::Tensor tile_offsets, // [C, tile_height, tile_width]
+    const at::Tensor flatten_ids,  // [n_isects]
+    const bool calculate_surface_distance,
+    // scratch: zero-initialised [C, N] int64, contribution + pixel id packed
+    at::Tensor max_contrib_packed,
+    // outputs
+    at::Tensor renders,         // [C, image_height, image_width, channels]
+    at::Tensor expected_depths, // [C, image_height, image_width]
+    at::Tensor max_contrib,     // [C, N]
+    at::Tensor max_pixel,       // [C, N]
+    at::Tensor min_surface_dist // [C, N]
+);
+
+/////////////////////////////////////////////////
 // rasterize_to_pixels_3dgs_geom (RaDe-GS geometry outputs)
 /////////////////////////////////////////////////
 
