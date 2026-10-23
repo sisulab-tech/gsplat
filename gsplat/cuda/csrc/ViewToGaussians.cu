@@ -30,7 +30,7 @@ __global__ void view_to_gaussians_fwd_kernel(
     const scalar_t *__restrict__ camtoworlds, // [C, 4, 4]
     const int32_t *__restrict__ radii, // [C, N, 2]
     // outputs
-    scalar_t *__restrict__ view2gaussians // [C, N, 10]
+    scalar_t *__restrict__ view2gaussians // [C, N, 12]
 ) {
     // parallelize over C * N.
     uint32_t idx = cg::this_grid().thread_rank();
@@ -45,7 +45,7 @@ __global__ void view_to_gaussians_fwd_kernel(
     camtoworlds += cid * 16;
     quats += gid * 4;
     scales += gid * 3;
-    view2gaussians += idx * 10;
+    view2gaussians += idx * 12;
 
     // glm is column-major but input is row-major
     mat3 camtoworlds_R = mat3(
@@ -74,54 +74,24 @@ __global__ void view_to_gaussians_fwd_kernel(
     vec3 view2gaussian_t =
         worldtogaussian_R * camtoworlds_t + worldtogaussian_t;
 
-    // precompute the value here to avoid repeated computations also reduce IO
-    // v is the viewdirection and v^scalar_t is the transpose of v
-    // t = position of the camera in the gaussian coordinate system
-    // A = v^scalar_t @ R^scalar_t @ S^-1 @ S^-1 @ R @ v
-    // B = t^scalar_t @ S^-1 @ S^-1 @ R @ v
-    // C = t^scalar_t @ S^-1 @ S^-1 @ t
-    // For the given caemra, t is fix and v depends on the pixel
-    // therefore we can precompute A, B, C and use them in the forward pass
-    // For A, we can precompute R^scalar_t @ S^-1 @ S^-1 @ R, which is a symmetric
-    // matrix and only store the upper triangle in 6 values For B, we can
-    // precompute S^-1 @ S^-1 @ R @ v, which is a vector and store it in 3
-    // values and C is fixed, so we only need to store 1 value Therefore, we
-    // only need to store 10 values in the view2gaussian matrix
-    vec3 scales_inv_square = {
-        1.0f / (scale.x * scale.x + 1e-10f),
-        1.0f / (scale.y * scale.y + 1e-10f),
-        1.0f / (scale.z * scale.z + 1e-10f)
+    // Whitened ray in the gaussian frame: for a camera ray r (z = 1) at depth
+    // t, the Mahalanobis distance is |o + t * M r|^2 with M = S^-1 R and
+    // o = S^-1 t_v2g. Storing M and o instead of the expanded quadric
+    // (r^T R^T S^-2 R r, ...) avoids float32 cancellation between ~1/s^2
+    // terms for very thin gaussians. Layout: M row-major (9), then o (3).
+    vec3 inv_s = {
+        rsqrtf(scale.x * scale.x + 1e-10f),
+        rsqrtf(scale.y * scale.y + 1e-10f),
+        rsqrtf(scale.z * scale.z + 1e-10f)
     };
-    scalar_t CC = view2gaussian_t.x * view2gaussian_t.x * scales_inv_square.x +
-           view2gaussian_t.y * view2gaussian_t.y * scales_inv_square.y +
-           view2gaussian_t.z * view2gaussian_t.z * scales_inv_square.z;
-
-    mat3 scales_inv_square_R = mat3(
-        scales_inv_square.x * view2gaussian_R[0][0],
-        scales_inv_square.y * view2gaussian_R[0][1],
-        scales_inv_square.z * view2gaussian_R[0][2],
-        scales_inv_square.x * view2gaussian_R[1][0],
-        scales_inv_square.y * view2gaussian_R[1][1],
-        scales_inv_square.z * view2gaussian_R[1][2],
-        scales_inv_square.x * view2gaussian_R[2][0],
-        scales_inv_square.y * view2gaussian_R[2][1],
-        scales_inv_square.z * view2gaussian_R[2][2]
-    );
-
-    vec3 BB = view2gaussian_t * scales_inv_square_R;
-    mat3 Sigma = glm::transpose(view2gaussian_R) * scales_inv_square_R;
-
-    // write to view2gaussian
-    view2gaussians[0] = Sigma[0][0];
-    view2gaussians[1] = Sigma[0][1];
-    view2gaussians[2] = Sigma[0][2];
-    view2gaussians[3] = Sigma[1][1];
-    view2gaussians[4] = Sigma[1][2];
-    view2gaussians[5] = Sigma[2][2];
-    view2gaussians[6] = BB.x;
-    view2gaussians[7] = BB.y;
-    view2gaussians[8] = BB.z;
-    view2gaussians[9] = CC;
+#pragma unroll
+    for (uint32_t r = 0; r < 3; ++r) {
+#pragma unroll
+        for (uint32_t c = 0; c < 3; ++c) {
+            view2gaussians[r * 3 + c] = inv_s[r] * view2gaussian_R[c][r];
+        }
+        view2gaussians[9 + r] = inv_s[r] * view2gaussian_t[r];
+    }
 }
 
 at::Tensor view_to_gaussians_fwd_tensor(
@@ -142,7 +112,7 @@ at::Tensor view_to_gaussians_fwd_tensor(
     uint32_t C = viewmats.size(0); // number of cameras
     at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
 
-    at::Tensor view2gaussians = at::empty({C, N, 10}, means.options());
+    at::Tensor view2gaussians = at::empty({C, N, 12}, means.options());
 
     if (C && N) {
         view_to_gaussians_fwd_kernel<float>

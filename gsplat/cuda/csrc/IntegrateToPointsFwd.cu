@@ -22,6 +22,16 @@ namespace cg = cooperative_groups;
  *the it projected into
  ****************************************************************************/
 
+// Ray direction in the whitened gaussian frame, M r with M packed row-major
+// in view2gaussian[0:9].
+inline __device__ vec3 whiten_dir(const vec12 &m, const vec3 &r) {
+    return {
+        m[0] * r.x + m[1] * r.y + m[2] * r.z,
+        m[3] * r.x + m[4] * r.y + m[5] * r.z,
+        m[6] * r.x + m[7] * r.y + m[8] * r.z
+    };
+}
+
 template <uint32_t CDIM, typename scalar_t>
 __global__ void integrate_to_points_fwd_kernel(
     const uint32_t C,
@@ -36,7 +46,7 @@ __global__ void integrate_to_points_fwd_kernel(
     const vec3 *__restrict__ conics,           // [C, N, 3] or [nnz, 3]
     const scalar_t *__restrict__ colors,       // [C, N, CDIM] or [nnz, CDIM]
     const scalar_t *__restrict__ opacities,    // [C, N] or [nnz]
-    const vec10 *__restrict__ view2gaussians,  // [C, N, 10] or [nnz, 10]
+    const vec12 *__restrict__ view2gaussians,  // [C, N, 12] or [nnz, 12]
     const scalar_t *__restrict__ Ks,           // [C, 3, 3]
     const scalar_t *__restrict__ backgrounds,  // [C, CDIM]
     const uint32_t image_width,
@@ -118,8 +128,8 @@ __global__ void integrate_to_points_fwd_kernel(
         reinterpret_cast<vec3 *>(&id_batch[block_size]); // [block_size]
     vec3 *conic_batch =
         reinterpret_cast<vec3 *>(&xy_opacity_batch[block_size]); // [block_size]
-    vec10 *view2gaussian_batch =
-        reinterpret_cast<vec10 *>(&conic_batch[block_size]); // [block_size]
+    vec12 *view2gaussian_batch =
+        reinterpret_cast<vec12 *>(&conic_batch[block_size]); // [block_size]
     vec3 *points2d_depth_batch =
         reinterpret_cast<vec3 *>(&view2gaussian_batch[block_size]
         ); // [block_size]
@@ -181,7 +191,7 @@ __global__ void integrate_to_points_fwd_kernel(
             const vec3 xy_opac = xy_opacity_batch[t];
             const scalar_t opac = xy_opac.z;
             // why not use pointer so we don't need to copy again?
-            const vec10 view2gaussian = view2gaussian_batch[t];
+            const vec12 view2gaussian = view2gaussian_batch[t];
 
             bool used = false;
             for (uint32_t k = 0; k < 5; ++k) {
@@ -191,25 +201,13 @@ __global__ void integrate_to_points_fwd_kernel(
                     1.0
                 };
 
-                const vec3 normal = {
-                    view2gaussian[0] * ray_k.x + view2gaussian[1] * ray_k.y +
-                        view2gaussian[2],
-                    view2gaussian[1] * ray_k.x + view2gaussian[3] * ray_k.y +
-                        view2gaussian[4],
-                    view2gaussian[2] * ray_k.x + view2gaussian[4] * ray_k.y +
-                        view2gaussian[5]
+                const vec3 d = whiten_dir(view2gaussian, ray_k);
+                const vec3 o = {
+                    view2gaussian[9], view2gaussian[10], view2gaussian[11]
                 };
 
-                // use AA, BB, CC so that the name is unique
-                scalar_t AA =
-                    ray_k.x * normal[0] + ray_k.y * normal[1] + normal[2];
-                scalar_t BB =
-                    2 * (view2gaussian[6] * ray_k.x +
-                         view2gaussian[7] * ray_k.y + view2gaussian[8]);
-                scalar_t CC = view2gaussian[9];
-
                 // t is the depth of the gaussian
-                scalar_t depth = -BB / (2 * AA);
+                scalar_t depth = -glm::dot(o, d) / glm::dot(d, d);
 
 // TODO take near plane as input
 #define NEAR_PLANE 0.01f
@@ -218,13 +216,8 @@ __global__ void integrate_to_points_fwd_kernel(
                 if (depth <= NEAR_PLANE)
                     continue;
 
-                // the scale of the gaussian is 1.f / sqrt(AA)
-                scalar_t min_value = -(BB / AA) * (BB / 4.) + CC;
-
-                scalar_t power = -0.5f * min_value;
-                if (power > 0.0f) {
-                    power = 0.0f;
-                }
+                const vec3 v = o + depth * d;
+                scalar_t power = -0.5f * glm::dot(v, v);
 
                 scalar_t alpha = min(0.999f, opac * exp(power));
 
@@ -448,7 +441,7 @@ __global__ void integrate_to_points_fwd_kernel(
                 const vec3 xy_opac = xy_opacity_batch[t];
                 const scalar_t opac = xy_opac.z;
                 // why not use pointer so we don't need to copy again?
-                const vec10 view2gaussian = view2gaussian_batch[t];
+                const vec12 view2gaussian = view2gaussian_batch[t];
 
                 for (uint32_t k = 0; k < num_projected; ++k) {
                     // if (pix_id == 550 * 1237 + 600 && k == 0){
@@ -463,35 +456,20 @@ __global__ void integrate_to_points_fwd_kernel(
                     };
                     const scalar_t ray_depth = projected_depth[k];
 
-                    const vec3 normal = {
-                        view2gaussian[0] * ray_k.x +
-                            view2gaussian[1] * ray_k.y + view2gaussian[2],
-                        view2gaussian[1] * ray_k.x +
-                            view2gaussian[3] * ray_k.y + view2gaussian[4],
-                        view2gaussian[2] * ray_k.x +
-                            view2gaussian[4] * ray_k.y + view2gaussian[5]
+                    const vec3 d = whiten_dir(view2gaussian, ray_k);
+                    const vec3 o = {
+                        view2gaussian[9], view2gaussian[10], view2gaussian[11]
                     };
 
-                    // use AA, BB, CC so that the name is unique
-                    scalar_t AA =
-                        ray_k.x * normal[0] + ray_k.y * normal[1] + normal[2];
-                    scalar_t BB =
-                        2 * (view2gaussian[6] * ray_k.x +
-                             view2gaussian[7] * ray_k.y + view2gaussian[8]);
-                    scalar_t CC = view2gaussian[9];
-
                     // t is the depth of the gaussian
-                    scalar_t depth = -BB / (2 * AA);
+                    scalar_t depth = -glm::dot(o, d) / glm::dot(d, d);
 
                     if (depth > ray_depth) {
                         depth = ray_depth;
                     }
 
-                    scalar_t power =
-                        -0.5f * (AA * depth * depth + BB * depth + CC);
-                    if (power > 0.0f) {
-                        power = 0.0f;
-                    }
+                    const vec3 v = o + depth * d;
+                    scalar_t power = -0.5f * glm::dot(v, v);
 
                     scalar_t alpha = min(0.999f, opac * exp(power));
 
@@ -532,7 +510,7 @@ std::tuple<at::Tensor, at::Tensor> call_kernel_with_dim(
     const at::Tensor conics,         // [C, N, 3] or [nnz, 3]
     const at::Tensor colors,         // [C, N, channels] or [nnz, channels]
     const at::Tensor opacities,      // [C, N]  or [nnz]
-    const at::Tensor view2gaussians, // [C, N, 10] or [nnz, 10]
+    const at::Tensor view2gaussians, // [C, N, 12] or [nnz, 12]
     const at::Tensor Ks,             // [C, 3, 3]
     const at::optional<at::Tensor> backgrounds, // [C, channels]
     // image size
@@ -603,7 +581,7 @@ std::tuple<at::Tensor, at::Tensor> call_kernel_with_dim(
     at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
     const uint32_t shared_mem = tile_size * tile_size *
                                 (sizeof(int32_t) + sizeof(vec3) + sizeof(vec3) +
-                                 sizeof(vec10) + sizeof(vec3));
+                                 sizeof(vec12) + sizeof(vec3));
 
     // TODO: an optimization can be done by passing the actual number of
     // channels into the kernel functions and avoid necessary global memory
@@ -633,7 +611,7 @@ std::tuple<at::Tensor, at::Tensor> call_kernel_with_dim(
             reinterpret_cast<vec3 *>(conics.data_ptr<float>()),
             colors.data_ptr<float>(),
             opacities.data_ptr<float>(),
-            reinterpret_cast<vec10 *>(view2gaussians.data_ptr<float>()),
+            reinterpret_cast<vec12 *>(view2gaussians.data_ptr<float>()),
             Ks.data_ptr<float>(),
             backgrounds.has_value() ? backgrounds.value().data_ptr<float>()
                                     : nullptr,
@@ -665,7 +643,7 @@ std::tuple<at::Tensor, at::Tensor> integrate_to_points_fwd_tensor(
     const at::Tensor conics,         // [C, N, 3] or [nnz, 3]
     const at::Tensor colors,         // [C, N, channels] or [nnz, channels]
     const at::Tensor opacities,      // [C, N]  or [nnz]
-    const at::Tensor view2gaussians, // [C, N, 10] or [nnz, 10]
+    const at::Tensor view2gaussians, // [C, N, 12] or [nnz, 12]
     const at::Tensor Ks,             // [C, 3, 3]
     const at::optional<at::Tensor> backgrounds, // [C, channels]
     // image size

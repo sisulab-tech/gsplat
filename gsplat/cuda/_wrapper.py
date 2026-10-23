@@ -3229,7 +3229,7 @@ def integrate_to_points(
     conics: Tensor,  # [C, N, 3] or [nnz, 3]
     colors: Tensor,  # [C, N, channels] or [nnz, channels]
     opacities: Tensor,  # [C, N] or [nnz]
-    view2guassian: Tensor,  # [C, N, 10] or [nnz, 10]
+    view2guassian: Tensor,  # [C, N, 12] or [nnz, 12]
     Ks: Tensor,  # [C, 3, 3]
     image_width: int,
     image_height: int,
@@ -3274,14 +3274,14 @@ def integrate_to_points(
         assert conics.shape == (nnz, 3), conics.shape
         assert colors.shape[0] == nnz, colors.shape
         assert opacities.shape == (nnz,), opacities.shape
-        assert view2guassian.shape == (nnz, 10), view2guassian.shape
+        assert view2guassian.shape == (nnz, 12), view2guassian.shape
     else:
         N = means2d.size(1)
         assert means2d.shape == (C, N, 2), means2d.shape
         assert conics.shape == (C, N, 3), conics.shape
         assert colors.shape[:2] == (C, N), colors.shape
         assert opacities.shape == (C, N), opacities.shape
-        assert view2guassian.shape == (C, N, 10), view2guassian.shape
+        assert view2guassian.shape == (C, N, 12), view2guassian.shape
         assert Ks.shape == (C, 3, 3), Ks.shape
         PN = points2d.size(1)
         assert points2d.shape == (C, PN, 2), points2d.shape
