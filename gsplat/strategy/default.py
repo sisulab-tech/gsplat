@@ -157,13 +157,8 @@ class DefaultStrategy(Strategy):
         step: int,
         info: Dict[str, Any],
         packed: bool = False,
-        defer_reset: bool = False,
     ):
-        """Callback function to be executed after the `loss.backward()` call.
-
-        With ``defer_reset`` the opacity reset of this step is skipped; the
-        caller must run :meth:`reset_opacity` itself.
-        """
+        """Callback function to be executed after the `loss.backward()` call."""
         if step >= self.refine_stop_iter:
             return
 
@@ -197,22 +192,13 @@ class DefaultStrategy(Strategy):
                 state["radii"].zero_()
             torch.cuda.empty_cache()
 
-        if not defer_reset and step % self.reset_every == 0 and step > 0:
-            self.reset_opacity(params=params, optimizers=optimizers, state=state)
-
-    def reset_opacity(
-        self,
-        params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
-        optimizers: Dict[str, torch.optim.Optimizer],
-        state: Dict[str, Any],
-    ):
-        """Clamp opacities to ``2 * prune_opa``."""
-        reset_opa(
-            params=params,
-            optimizers=optimizers,
-            state=state,
-            value=self.prune_opa * 2.0,
-        )
+        if step % self.reset_every == 0 and step > 0:
+            reset_opa(
+                params=params,
+                optimizers=optimizers,
+                state=state,
+                value=self.prune_opa * 2.0,
+            )
 
     def _update_state(
         self,

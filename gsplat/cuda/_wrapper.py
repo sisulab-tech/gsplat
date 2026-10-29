@@ -1066,7 +1066,6 @@ def rasterize_to_indices_in_range(
     tile_size: int,
     isect_offsets: Tensor,  # [C, tile_height, tile_width]
     flatten_ids: Tensor,  # [n_isects]
-    visibility_threshold: float = 0.0,
 ) -> Tuple[Tensor, Tensor, Tensor]:
     """Rasterizes a batch of Gaussians to images but only returns the indices.
 
@@ -1089,10 +1088,6 @@ def rasterize_to_indices_in_range(
         tile_size: Tile size.
         isect_offsets: Intersection offsets outputs from `isect_offset_encode()`. [C, tile_height, tile_width]
         flatten_ids: The global flatten indices in [C * N] from  `isect_tiles()`. [n_isects]
-        visibility_threshold: If > 0, a gaussian is recorded for a pixel only while the
-            pre-composite transmittance at that pixel exceeds this threshold, mirroring PGSR's
-            ``out_observe`` front-visibility count (``T > 0.5``). The default 0.0 records all
-            contributors (down to full opacity), preserving prior behaviour.
 
     Returns:
         A tuple:
@@ -1118,7 +1113,6 @@ def rasterize_to_indices_in_range(
     out_gauss_ids, out_indices = _make_lazy_cuda_func("rasterize_to_indices_3dgs")(
         range_start,
         range_end,
-        float(visibility_threshold),
         transmittances.contiguous(),
         means2d.contiguous(),
         conics.contiguous(),

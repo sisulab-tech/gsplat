@@ -402,8 +402,7 @@ rasterize_to_pixels_eval3d_geom_bwd(
 // Rasterize 3D Gaussian, but only return the indices of gaussians and pixels.
 std::tuple<at::Tensor, at::Tensor> rasterize_to_indices_3dgs(
     const uint32_t range_start,
-    const uint32_t range_end,          // iteration steps
-    const float visibility_threshold,  // observe gate: T>threshold (0 = off)
+    const uint32_t range_end,        // iteration steps
     const at::Tensor transmittances, // [C, image_height, image_width]
     // Gaussian parameters
     const at::Tensor means2d,   // [C, N, 2]
