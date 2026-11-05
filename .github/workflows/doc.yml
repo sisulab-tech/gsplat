@@ -13,7 +13,7 @@ permissions:
   contents: write
 jobs:
   docs:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, self-ubuntu-x86]
     steps:
       - uses: actions/checkout@v3
         with:

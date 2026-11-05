@@ -4,7 +4,7 @@ on: [workflow_call, workflow_dispatch]
 jobs:
   build_sdist:
     name: Build source distribution and no binary wheel
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, self-ubuntu-x86]
     steps:
       - uses: actions/checkout@v4
       - name: Strip unsupported tags in README
@@ -26,7 +26,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, windows-2019]
+        os: [self-ubuntu-x86, windows-2019]
         python-version: ['3.10']
         torch-version: ['2.0.0', '2.1.0', '2.2.0', '2.3.0', '2.4.0']
         cuda-version: ['cu118', 'cu121', 'cu124']

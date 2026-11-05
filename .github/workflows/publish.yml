@@ -19,7 +19,7 @@ jobs:
   create_release_and_upload_packages:
     name: Upload to GitHub Release
     needs: [build_wheels]
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, self-ubuntu-x86]
     strategy:
       fail-fast: false
       matrix:
@@ -66,7 +66,7 @@ jobs:
   generate_simple_index_pages:
     name: Generate Simple Index Pages
     needs: [create_release_and_upload_packages]
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, self-ubuntu-x86]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -88,7 +88,7 @@ jobs:
   upload_pypi:
     name: Upload to PyPi
     needs: [build_wheels]
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, self-ubuntu-x86]
     environment: production
     steps:
       - name: Checkout code
