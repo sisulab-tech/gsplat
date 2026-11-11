@@ -54,6 +54,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     );
     m.def("rasterize_to_indices_3dgs", &gsplat::rasterize_to_indices_3dgs);
     m.def(
+        "rasterize_to_pixels_3dgs_count",
+        &gsplat::rasterize_to_pixels_3dgs_count
+    );
+    m.def(
         "rasterize_to_pixels_3dgs_geom_fwd",
         &gsplat::rasterize_to_pixels_3dgs_geom_fwd
     );

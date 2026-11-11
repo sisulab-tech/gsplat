@@ -417,6 +417,20 @@ std::tuple<at::Tensor, at::Tensor> rasterize_to_indices_3dgs(
     const at::Tensor flatten_ids   // [n_isects]
 );
 
+// Per Gaussian, the number of masked pixels it contributes to in the 3DGS
+// forward pass. Returns int32 [C * N] or [nnz].
+at::Tensor rasterize_to_pixels_3dgs_count(
+    const at::Tensor means2d,     // [C, N, 2] or [nnz, 2]
+    const at::Tensor conics,      // [C, N, 3] or [nnz, 3]
+    const at::Tensor opacities,   // [C, N] or [nnz]
+    const at::Tensor pixel_masks, // [C, image_height, image_width] bool
+    const uint32_t image_width,
+    const uint32_t image_height,
+    const uint32_t tile_size,
+    const at::Tensor tile_offsets, // [C, tile_height, tile_width]
+    const at::Tensor flatten_ids   // [n_isects]
+);
+
 // Relocate some Gaussians in the Densification Process.
 // Equation (9) in "3D Gaussian Splatting as Markov Chain Monte Carlo"
 std::tuple<at::Tensor, at::Tensor> relocation(

@@ -1128,6 +1128,41 @@ def rasterize_to_indices_in_range(
     return out_gauss_ids, out_pixel_ids, out_camera_ids
 
 
+@torch.no_grad()
+def rasterize_to_pixels_count(
+    means2d: Tensor,  # [C, N, 2] or [nnz, 2]
+    conics: Tensor,  # [C, N, 3] or [nnz, 3]
+    opacities: Tensor,  # [C, N] or [nnz]
+    pixel_masks: Tensor,  # [C, image_height, image_width] bool
+    image_width: int,
+    image_height: int,
+    tile_size: int,
+    isect_offsets: Tensor,  # [C, tile_height, tile_width]
+    flatten_ids: Tensor,  # [n_isects]
+) -> Tensor:
+    """Per projected Gaussian, the number of ``pixel_masks`` pixels it contributes to.
+
+    A Gaussian contributes to a pixel when the 3DGS forward pass blends it there:
+    alpha >= 1/255 before the pixel's transmittance terminates. Inputs are the
+    projection and tile-intersection outputs that ``rasterization`` returns in
+    its meta. Returns int32 ``[C, N]`` (``[nnz]`` when packed).
+    """
+    C = isect_offsets.shape[0]
+    assert pixel_masks.shape == (C, image_height, image_width), pixel_masks.shape
+    counts = _make_lazy_cuda_func("rasterize_to_pixels_3dgs_count")(
+        means2d.contiguous(),
+        conics.contiguous(),
+        opacities.contiguous(),
+        pixel_masks.contiguous(),
+        image_width,
+        image_height,
+        tile_size,
+        isect_offsets.contiguous(),
+        flatten_ids.contiguous(),
+    )
+    return counts.view(opacities.shape)
+
+
 class _QuatScaleToCovarPreci(torch.autograd.Function):
     """Converts quaternions and scales to covariance and precision matrices."""
 
